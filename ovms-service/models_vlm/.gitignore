@@ -1,0 +1,10 @@
+# OVMS Model Files
+# Large model files should not be committed to git
+# Use setup_models.sh to copy them from your OVMS installation
+
+# Ignore the entire Qwen model directory
+Qwen/
+
+# Keep the config.json and README
+!config.json
+!README.md

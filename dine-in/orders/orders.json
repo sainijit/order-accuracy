@@ -1,0 +1,132 @@
+{
+  "orders": [
+    {
+      "image_id": "image_01_mcd_combo",
+      "restaurant": "McDonald's",
+      "table_number": "T12",
+      "ticket_id": "MCD-1001",
+      "items_ordered": [
+        { "item": "Big Mac", "quantity": 2 },
+        { "item": "French Fries", "quantity": 2 },
+        { "item": "Chicken McNuggets", "quantity": 20 },
+        { "item": "Coca Cola", "quantity": 2 }
+      ]
+    },
+    {
+      "image_id": "image_02_mcd_variation",
+      "restaurant": "McDonald's",
+      "table_number": "T08",
+      "ticket_id": "MCD-1002",
+      "items_ordered": [
+        { "item": "Cheeseburger", "quantity": 1 },
+        { "item": "Quarter Pounder", "quantity": 1 },
+        { "item": "French Fries", "quantity": 1 },
+        { "item": "Chicken Nuggets", "quantity": 10 }
+      ]
+    },
+    {
+      "image_id": "image_03_kfc_combo",
+      "restaurant": "KFC",
+      "table_number": "T21",
+      "ticket_id": "KFC-2001",
+      "items_ordered": [
+        { "item": "Fried Chicken", "quantity": 6 },
+        { "item": "Chicken Burger", "quantity": 1 },
+        { "item": "French Fries", "quantity": 1 },
+        { "item": "Coleslaw", "quantity": 1 },
+        { "item": "Biscuit", "quantity": 2 }
+      ]
+    },
+    {
+      "image_id": "image_04_burgerking_combo",
+      "restaurant": "Burger King",
+      "table_number": "T05",
+      "ticket_id": "BK-3001",
+      "items_ordered": [
+        { "item": "Whopper Burger", "quantity": 2 },
+        { "item": "Chicken Nuggets", "quantity": 12 },
+        { "item": "French Fries", "quantity": 2 },
+        { "item": "Milkshake", "quantity": 1 }
+      ]
+    },
+    {
+      "image_id": "plate_05_salmon_asparagus_mash",
+      "restaurant": "Casual Dining Grill",
+      "table_number": "12",
+      "ticket_id": "DIN-5001",
+      "items_ordered": [
+        {
+          "item": "Grilled Salmon",
+          "quantity": 1,
+          "modifiers": ["lemon butter"]
+        },
+        {
+          "item": "Roasted Asparagus",
+          "quantity": 1,
+          "modifiers": []
+        },
+        {
+          "item": "Mashed Potatoes",
+          "quantity": 1,
+          "modifiers": ["butter"]
+        }
+      ]
+    },
+    {
+      "image_id": "plate_06_fried_chicken_combo",
+      "restaurant": "American Kitchen",
+      "table_number": "22",
+      "ticket_id": "DIN-5004",
+      "items_ordered": [
+        {
+          "item": "Fried Chicken",
+          "quantity": 4,
+          "modifiers": []
+        },
+        {
+          "item": "French Fries",
+          "quantity": 1,
+          "modifiers": []
+        },
+        {
+          "item": "Coleslaw",
+          "quantity": 1,
+          "modifiers": []
+        },
+        {
+          "item": "Dipping Sauce",
+          "quantity": 1,
+          "modifiers": ["barbecue"]
+        }
+      ]
+    },
+    {
+      "image_id": "plate_07_chicken_parmesan_combo",
+      "restaurant": "Italian Bistro",
+      "table_number": "9",
+      "ticket_id": "DIN-5005",
+      "items_ordered": [
+        {
+          "item": "Chicken Parmesan",
+          "quantity": 1,
+          "modifiers": ["cheese", "marinara sauce"]
+        },
+        {
+          "item": "Spaghetti with Marinara",
+          "quantity": 1,
+          "modifiers": []
+        },
+        {
+          "item": "Steamed Broccoli",
+          "quantity": 1,
+          "modifiers": []
+        },
+        {
+          "item": "Mashed Potatoes",
+          "quantity": 1,
+          "modifiers": []
+        }
+      ]
+    }
+  ]
+}

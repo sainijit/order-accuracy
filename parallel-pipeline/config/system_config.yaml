@@ -1,0 +1,65 @@
+# Video sources (can be RTSP streams or file paths)
+# Using file sources from application.yaml for testing
+rtsp_urls:
+  - /videos/video1.mp4
+  - /videos/video2.mp4
+  - /videos/video1.mp4
+  - /videos/video1.mp4
+
+# Model paths
+yolo_model_path: ../model/yolo11n_openvino_model
+
+# Data paths
+inventory_path: ../config/inventory.json
+orders_path: ../config/orders.json
+
+# Queue backend
+queue_backend: multiprocessing  # or "redis"
+redis_host: localhost
+redis_port: 6379
+
+# Metrics configuration
+metrics_sample_interval: 1.0
+metrics_window_size: 30
+
+# Control loop interval
+control_loop_interval: 5.0
+
+# VLM configuration
+vlm:
+  ovms_url: http://ovms-vlm:8000  # Docker network hostname
+  model_name: Qwen/Qwen2.5-VL-7B-Instruct-ov-int8  # Must match OVMS config.json
+  batch_window_ms: 100
+  max_batch_size: 16
+  max_workers: 4
+  timeout_seconds: 30.0
+
+# Storage configuration
+storage:
+  minio_endpoint: minio:9000  # Docker network hostname
+  minio_access_key: minioadmin
+  minio_secret_key: minioadmin
+  minio_bucket: orders
+  minio_secure: false
+  frames_bucket: frames
+
+# Scaling policy
+scaling:
+  enabled: true
+  
+  # Scale UP thresholds (all must be true)
+  scale_up_gpu_threshold: 85.0  # GPU < 85%
+  scale_up_cpu_threshold: 80.0  # CPU < 80%
+  scale_up_latency_threshold: 5.0  # Latency < 5s
+  
+  # Scale DOWN thresholds (any can be true)
+  scale_down_gpu_threshold: 95.0  # GPU > 95%
+  scale_down_cpu_threshold: 90.0  # CPU > 90%
+  scale_down_latency_threshold: 5.0  # Latency > 5s
+  
+  # Hysteresis to prevent rapid scaling
+  hysteresis_window: 30.0  # seconds
+  
+  # Station limits
+  min_stations: 1
+  max_stations: 8
