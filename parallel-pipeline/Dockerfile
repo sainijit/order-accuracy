@@ -67,7 +67,7 @@ COPY parallel-pipeline/ .
 COPY application-service/app/ /app/application-service/app/
 COPY frame-selector-service/app/ /app/frame-selector-service/app/
 
-# Set Python path to include sibling directories and DL Streamer (CRITICAL for gvapython)
+# Set Python path to include /app first (for local frame_pipeline.py), then sibling directories and DL Streamer (CRITICAL for gvapython)
 ENV PYTHONPATH=/app:/app/application-service/app:/app/frame-selector-service/app:/opt/intel/dlstreamer/python:/opt/intel/dlstreamer/gstreamer/lib/python3/dist-packages:/home/dlstreamer/dlstreamer/python
 
 # Set GStreamer plugin path

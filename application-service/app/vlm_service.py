@@ -2,16 +2,34 @@ import os
 import re
 import time
 import asyncio
+import logging
 import numpy as np
-import openvino as ov
 from PIL import Image
 from minio import Minio
 from minio.error import S3Error
-from openvino_genai import VLMPipeline, GenerationConfig
 from config_loader import load_config
 from order_results import add_result
 from validation_agent import validate_order
+from vlm_backend_factory import VLMBackendFactory
 import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Conditional imports for embedded backend
+try:
+    import openvino as ov
+    from openvino_genai import VLMPipeline, GenerationConfig
+    EMBEDDED_AVAILABLE = True
+    logger.info("OpenVINO GenAI available for embedded backend")
+except ImportError:
+    EMBEDDED_AVAILABLE = False
+    logger.warning("OpenVINO GenAI not available. Use OVMS backend.")
 
 # ============================================================
 # CONFIG
@@ -26,18 +44,24 @@ VLM_CFG = cfg["vlm"]
 MINIO_ENDPOINT = MINIO["endpoint"]
 SELECTED_BUCKET = BUCKETS["selected"]
 
+# Backend configuration
+VLM_BACKEND = os.getenv("VLM_BACKEND", VLM_CFG.get("backend", "embedded")).lower()
+MAX_NEW_TOKENS = VLM_CFG.get("max_new_tokens", 512)
+TEMPERATURE = VLM_CFG.get("temperature", 0.2)
+
+# Legacy configuration (for embedded backend)
 MODEL_PATH = os.getenv(
     "VLM_MODEL_PATH",
     VLM_CFG.get("model_path", "/models/Qwen2.5-VL-7B-Instruct-ov-int8")
 )
-
 DEVICE = os.getenv(
     "OPENVINO_DEVICE",
     VLM_CFG.get("device", "GPU")
 )
 
-MAX_NEW_TOKENS = VLM_CFG.get("max_new_tokens", 512)
-TEMPERATURE = VLM_CFG.get("temperature", 0.2)
+logger.info(f"VLM Configuration: backend={VLM_BACKEND.upper()}, max_tokens={MAX_NEW_TOKENS}, temperature={TEMPERATURE}")
+if VLM_BACKEND == "embedded":
+    logger.info(f"Embedded backend config: model_path={MODEL_PATH}, device={DEVICE}")
 
 # ============================================================
 # INVENTORY
@@ -46,7 +70,10 @@ TEMPERATURE = VLM_CFG.get("temperature", 0.2)
 INVENTORY = cfg.get("inventory", [])
 
 if not INVENTORY:
-    print("[VLM] WARNING: Inventory list is empty", flush=True)
+    logger.warning("Inventory list is empty - VLM will have no product constraints")
+else:
+    logger.info(f"Loaded inventory with {len(INVENTORY)} items")
+    logger.debug(f"Inventory items: {INVENTORY}")
 
 INVENTORY_TEXT = "\n".join(f"- {item}" for item in INVENTORY)
 
@@ -59,9 +86,10 @@ ORDERS_FILE = "/config/orders.json"
 try:
     with open(ORDERS_FILE, "r") as f:
         EXPECTED_ORDERS = json.load(f)
-    print(f"[VLM] Loaded orders.json with {len(EXPECTED_ORDERS)} orders", flush=True)
+    logger.info(f"Loaded {len(EXPECTED_ORDERS)} expected orders from {ORDERS_FILE}")
+    logger.debug(f"Order IDs: {list(EXPECTED_ORDERS.keys())}")
 except Exception as e:
-    print("[VLM] ERROR loading orders.json:", e, flush=True)
+    logger.error(f"Failed to load orders.json: {e}")
     EXPECTED_ORDERS = {}
 
 # ============================================================
@@ -87,27 +115,39 @@ BLACKLIST = {
 class VLMComponent:
     _model = None
     _config_key = None
-
-    def __init__(self, model_path, device, max_new_tokens, temperature):
-        config_key = (model_path, device, max_new_tokens, temperature)
+    
+    def __init__(self, backend_type, config, max_new_tokens, temperature):
+        config_key = (backend_type, str(config), max_new_tokens, temperature)
 
         if VLMComponent._model is None or VLMComponent._config_key != config_key:
-            print(f"[VLM] Loading model from {model_path} on {device}", flush=True)
+            logger.info(f"Initializing {backend_type.upper()} backend...")
+            logger.debug(f"Backend config: {config}")
 
-            core = ov.Core()
-            if device.upper().startswith("GPU"):
-                core.set_property("GPU", {"GPU_THROUGHPUT_STREAMS": "1"})
-
-            VLMComponent._model = VLMPipeline(models_path=model_path, device=device)
+            # Use factory to create backend
+            self.vlm, self.gen_config = VLMBackendFactory.create_backend(
+                backend_type=backend_type,
+                config=config,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            
+            VLMComponent._model = self.vlm
             VLMComponent._config_key = config_key
-            print("[VLM] Model loaded successfully", flush=True)
-
-        self.vlm = VLMComponent._model
-        self.gen_config = GenerationConfig(
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=False
-        )
+            logger.info(f"{backend_type.upper()} backend initialized successfully")
+        else:
+            logger.debug(f"Reusing existing {backend_type.upper()} backend instance")
+            self.vlm = VLMComponent._model
+            # Reconstruct gen_config from cached model
+            if hasattr(VLMComponent._model, 'gen_config'):
+                self.gen_config = VLMComponent._model.gen_config
+            else:
+                # For OVMS client, create mock config
+                from ovms_client import MockGenerationConfig
+                self.gen_config = MockGenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=False
+                )
 
     @staticmethod
     def extract_items(text: str):
@@ -128,12 +168,19 @@ class VLMComponent:
 
     def process(self, images: list[np.ndarray]):
         if not images:
+            logger.error("VLM process called with empty images list")
             raise ValueError("images list is empty")
 
+        logger.debug(f"Processing {len(images)} images with VLM")
         ov_frames = [ov.Tensor(img) for img in images]
         num_frames = len(ov_frames)
 
-        img_tags = "".join(f"<ov_genai_image_{i}>" for i in range(num_frames))
+        # Image tags are only for embedded backend
+        # OVMS automatically associates images with the prompt
+        if VLM_BACKEND == "embedded":
+            img_tags = "".join(f"<ov_genai_image_{i}>" for i in range(num_frames))
+        else:
+            img_tags = ""
 
         # ===== Inventory-aware prompt =====
         prompt = (
@@ -148,16 +195,58 @@ class VLMComponent:
             f"{img_tags}"
         )
 
+        logger.debug(f"VLM prompt length: {len(prompt)} chars")
+        logger.info(f"VLM prompt (first 500 chars): {prompt[:500]}")
+        logger.info(f"VLM prompt (last 200 chars): {prompt[-200:]}")
+        logger.info(f"Image tags used: {repr(img_tags)}")
+        logger.info(f"Number of ov_frames: {len(ov_frames)}, shapes: {[f.shape for f in ov_frames]}")
+        
+        # Write prompt to debug file
+        with open('/tmp/vlm_prompt.txt', 'w') as f:
+            f.write(f"Full Prompt:\n{prompt}\n\n")
+            f.write(f"Image tags: {img_tags}\n")
+            f.write(f"Number of frames: {num_frames}\n")
+        
+        logger.info(f"Starting VLM generation...")
         start = time.perf_counter()
 
-        output = self.vlm.generate(
-            prompt,
-            images=ov_frames,
-            generation_config=self.gen_config
-        )
+        try:
+            output = self.vlm.generate(
+                prompt,
+                images=ov_frames,
+                generation_config=self.gen_config
+            )
+            logger.info(f"VLM generation completed, extracting text...")
+        except Exception as e:
+            logger.error(f"VLM generation failed: {e}")
+            raise
 
         elapsed = time.perf_counter() - start
-        raw_text = output.texts[0]
+        
+        try:
+            raw_text = output.texts[0]
+            logger.info(f"Extracted raw text, length={len(raw_text)}")
+        except Exception as e:
+            logger.error(f"Failed to extract text from output: {e}")
+            logger.error(f"Output type: {type(output)}, dir: {dir(output)}")
+            raise
+        
+        # Debug: Write raw output to file
+        try:
+            with open('/tmp/vlm_raw_output.txt', 'a') as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"Timestamp: {time.time()}\n")
+                f.write(f"Raw text length: {len(raw_text)}\n")
+                f.write(f"Raw text: {repr(raw_text)}\n")
+                f.write(f"{'='*70}\n")
+            logger.info("Debug output written to /tmp/vlm_raw_output.txt")
+        except Exception as e:
+            logger.error(f"Failed to write debug output: {e}")
+        
+        logger.debug(f"VLM raw output: {raw_text}")
+        logger.info(f"VLM raw output text: {raw_text}")  # Also log at INFO level
+        print(f"\n{'='*70}\nVLM RAW OUTPUT:\n{raw_text}\n{'='*70}\n", flush=True)  # Force print to stdout
+        
         items = self.extract_items(raw_text)
 
         response = {
@@ -166,7 +255,8 @@ class VLMComponent:
             "inference_time_sec": round(elapsed, 3),
         }
 
-        print("[VLM] Output:", response, flush=True)
+        logger.info(f"VLM inference completed: {len(items)} items detected in {elapsed:.3f}s")
+        logger.debug(f"VLM response: {response}")
         return response
 
 
@@ -174,9 +264,24 @@ class VLMComponent:
 # GLOBAL VLM INSTANCE
 # ============================================================
 
+# Prepare backend config based on backend type
+if VLM_BACKEND == "ovms":
+    backend_config = {
+        "ovms_endpoint": os.getenv("OVMS_ENDPOINT", VLM_CFG.get("ovms_endpoint", "http://ovms-vlm:8000")),
+        "ovms_model": os.getenv("OVMS_MODEL_NAME", VLM_CFG.get("ovms_model", "Qwen/Qwen2-VL-2B-Instruct")),
+        "timeout_sec": VLM_CFG.get("timeout_sec", 120),
+    }
+elif VLM_BACKEND == "embedded":
+    backend_config = {
+        "model_path": MODEL_PATH,
+        "device": DEVICE,
+    }
+else:
+    raise ValueError(f"Unsupported VLM_BACKEND: {VLM_BACKEND}. Use 'embedded' or 'ovms'")
+
 vlm_instance = VLMComponent(
-    MODEL_PATH,
-    device=DEVICE,
+    backend_type=VLM_BACKEND,
+    config=backend_config,
     max_new_tokens=MAX_NEW_TOKENS,
     temperature=TEMPERATURE,
 )
@@ -189,16 +294,18 @@ vlm_queue: asyncio.Queue = asyncio.Queue()
 _worker_started = False
 
 async def _vlm_worker():
-    print("[VLM-WORKER] Started (sequential mode)", flush=True)
+    logger.info("VLM worker started (sequential processing mode)")
 
     while True:
         order_id, future = await vlm_queue.get()
 
         try:
-            print(f"[VLM-WORKER] Processing order {order_id}", flush=True)
+            logger.info(f"[WORKER] Processing order_id={order_id} (queue_remaining={vlm_queue.qsize()})")
             result = await _run_vlm_internal(order_id)
             future.set_result(result)
+            logger.info(f"[WORKER] Completed order_id={order_id}, status={result.get('status')}")
         except Exception as e:
+            logger.error(f"[WORKER] Failed processing order_id={order_id}: {e}", exc_info=True)
             future.set_result({
                 "order_id": order_id,
                 "status": "error",
@@ -212,41 +319,62 @@ async def _vlm_worker():
 # ============================================================
 
 async def _run_vlm_internal(order_id: str):
-    print(f"[VLM] Order ID: {order_id}", flush=True)
+    logger.info(f"[INTERNAL] Starting VLM processing for order_id={order_id}")
 
-    frames = []
     try:
-        for obj in client.list_objects(
-            SELECTED_BUCKET,
-            prefix=f"{order_id}/",
-            recursive=True
-        ):
-            if obj.object_name.lower().endswith(".jpg"):
-                frames.append(obj.object_name)
-    except S3Error:
-        return {"order_id": order_id, "status": "error", "reason": "minio_list_failed"}
+        frames = []
+        logger.debug(f"[INTERNAL] Listing frames from MinIO bucket={SELECTED_BUCKET}, prefix={order_id}/")
+        try:
+            for obj in client.list_objects(
+                SELECTED_BUCKET,
+                prefix=f"{order_id}/",
+                recursive=True
+            ):
+                if obj.object_name.lower().endswith(".jpg"):
+                    frames.append(obj.object_name)
+        except S3Error as e:
+            logger.error(f"[INTERNAL] MinIO list failed for order_id={order_id}: {e}")
+            return {"order_id": order_id, "status": "error", "reason": "minio_list_failed"}
 
-    if not frames:
-        return {"order_id": order_id, "status": "no_frames"}
+        if not frames:
+            logger.warning(f"[INTERNAL] No frames found for order_id={order_id}")
+            return {"order_id": order_id, "status": "no_frames"}
 
-    frames.sort()
+        frames.sort()
+        logger.info(f"[INTERNAL] Found {len(frames)} frames for order_id={order_id}")
+        logger.debug(f"[INTERNAL] Frame keys: {frames}")
 
-    images = []
-    for f in frames:
-        data = client.get_object(SELECTED_BUCKET, f)
-        img = Image.open(data).convert("RGB").resize((512, 512))
-        images.append(np.array(img))
+        images = []
+        for f in frames:
+            logger.debug(f"[INTERNAL] Loading frame: {f}")
+            data = client.get_object(SELECTED_BUCKET, f)
+            img = Image.open(data).convert("RGB").resize((512, 512))
+            images.append(np.array(img))
+        
+        logger.info(f"[INTERNAL] Loaded {len(images)} images, starting VLM inference for order_id={order_id}")
 
-    # ---- Run VLM ----
-    vlm_result = vlm_instance.process(images)
-    detected_items = vlm_result["items"]
+        # ---- Run VLM ----
+        vlm_result = vlm_instance.process(images)
+        detected_items = vlm_result["items"]
+        logger.info(f"[INTERNAL] VLM detected {len(detected_items)} items for order_id={order_id}")
+        logger.debug(f"[INTERNAL] Detected items: {detected_items}")
+    except Exception as e:
+        logger.error(f"[INTERNAL] Error before validation for order_id={order_id}: {e}", exc_info=True)
+        raise
 
     expected_items = EXPECTED_ORDERS.get(order_id)
     if expected_items is None:
+        logger.error(f"[INTERNAL] Order not found in orders.json: order_id={order_id}")
         return {"order_id": order_id, "status": "error", "reason": "order_not_found"}
 
+    logger.info(f"[INTERNAL] Expected items for order_id={order_id}: {len(expected_items)} items")
+    logger.debug(f"[INTERNAL] Expected items detail: {expected_items}")
+    
     # ---- Validate (uses VLM semantic reasoning internally) ----
+    logger.info(f"[INTERNAL] Starting validation for order_id={order_id}")
     validation = validate_order(expected_items, detected_items, vlm_instance.vlm)
+    logger.info(f"[INTERNAL] Validation complete for order_id={order_id}")
+    logger.debug(f"[INTERNAL] Validation results: {validation}")
 
     has_errors = (
         validation["missing"] or
@@ -264,7 +392,10 @@ async def _run_vlm_internal(order_id: str):
         "inference_time_sec": vlm_result["inference_time_sec"]
     }
 
+    logger.info(f"[INTERNAL] Final status for order_id={order_id}: {final_result['status']}")
+    logger.debug(f"[INTERNAL] Storing result in order_results deque")
     add_result(final_result)
+    logger.info(f"[INTERNAL] Result stored successfully for order_id={order_id}")
     return final_result
 
 
@@ -275,15 +406,20 @@ async def _run_vlm_internal(order_id: str):
 async def run_vlm(order_id: str):
     global _worker_started
 
+    logger.info(f"[API] VLM request received for order_id={order_id}")
     loop = asyncio.get_running_loop()
     future = loop.create_future()
 
     await vlm_queue.put((order_id, future))
-
-    print(f"[VLM-QUEUE] Registered order {order_id} (queue_size={vlm_queue.qsize()})", flush=True)
+    queue_size = vlm_queue.qsize()
+    logger.info(f"[API] Order queued: order_id={order_id}, queue_size={queue_size}")
 
     if not _worker_started:
+        logger.info("[API] Starting VLM worker task")
         asyncio.create_task(_vlm_worker())
         _worker_started = True
 
-    return await future
+    logger.debug(f"[API] Waiting for VLM processing of order_id={order_id}")
+    result = await future
+    logger.info(f"[API] VLM processing completed for order_id={order_id}")
+    return result

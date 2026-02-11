@@ -34,6 +34,9 @@ MINIO_ENDPOINT = MINIO["endpoint"]
 
 HAND_LABELS = {"hand", "person"}
 
+# Station ID from environment variable (set by worker process)
+STATION_ID = os.environ.get('STATION_ID', 'station_unknown')
+
 # ====== MinIO client ======
 client = Minio(
     MINIO_ENDPOINT,
@@ -49,8 +52,11 @@ if not client.bucket_exists(FRAMES_BUCKET):
     except Exception as e:
         print("[frame_to_minio] Warning - cannot create bucket:", e)
 
-# ====== globals ======
+# ====== globals for persistent pipeline ======
 _frame_counter = 0
+_current_order_id = None
+_order_frame_count = 0
+_last_order_time = time.time()
 
 # ====== helpers ======
 def safe_get_image(frame):
@@ -189,7 +195,7 @@ def upload_frame(order_id: str, frame_idx: int, image_bgr):
             print("[frame_to_minio] Failed to encode frame")
             return False
         data = buf.tobytes()
-        key = f"{order_id}/{frame_idx}.jpg"
+        key = f"{STATION_ID}/{order_id}/frame_{frame_idx}.jpg"
         client.put_object(
             FRAMES_BUCKET,
             key,
@@ -203,15 +209,43 @@ def upload_frame(order_id: str, frame_idx: int, image_bgr):
         print("[frame_to_minio] Upload error:", e)
         return False
 
+def finalize_order(order_id: str):
+    """
+    Write EOS (End-Of-Stream) marker for completed order.
+    
+    This signals to the worker that all frames for this order are ready.
+    """
+    try:
+        eos_key = f"{STATION_ID}/{order_id}/__EOS__"
+        client.put_object(
+            FRAMES_BUCKET,
+            eos_key,
+            io.BytesIO(b""),
+            0,
+            content_type="text/plain"
+        )
+        print(f"[frame_to_minio] Finalized order {order_id} with EOS marker")
+        return True
+    except Exception as e:
+        print(f"[frame_to_minio] Failed to write EOS marker for {order_id}: {e}")
+        return False
 
 # ====== gvapython entrypoint ======
 def process_frame(frame: "VideoFrame"):
     """
     Called by gvapython plugin. Return True to continue pipeline.
+    
+    For persistent pipeline, this handles:
+    - Continuous order detection via OCR
+    - Order segmentation (new order_id = finalize previous)
+    - Per-order frame grouping in MinIO
+    - EOS marker writing when order changes
     """
-    global _frame_counter
+    global _frame_counter, _current_order_id, _order_frame_count, _last_order_time
     _frame_counter += 1
-    print(f"[frame_to_minio] Frame#{_frame_counter} hit")
+    
+    if _frame_counter % 50 == 0:  # Log every 50 frames to reduce noise
+        print(f"[frame_to_minio] Processed {_frame_counter} frames total")
 
     try:
         # 1) get image robustly
@@ -245,9 +279,36 @@ def process_frame(frame: "VideoFrame"):
         order_id = READ_ORDER_ID_FN(image)
 
         if not order_id:
+            # No order detected, check if we should timeout current order
+            if _current_order_id and (time.time() - _last_order_time) > 10:
+                print(f"[frame_to_minio] Order {_current_order_id} timeout after 10s, finalizing with {_order_frame_count} frames")
+                finalize_order(_current_order_id)
+                _current_order_id = None
+                _order_frame_count = 0
             return True
 
-        upload_frame(order_id, _frame_counter, image)
+        # Order detected - check if it's a new order
+        if order_id != _current_order_id:
+            # New order detected!
+            if _current_order_id:
+                # Finalize previous order
+                print(f"[frame_to_minio] Order change: {_current_order_id} -> {order_id}, finalizing previous with {_order_frame_count} frames")
+                finalize_order(_current_order_id)
+            
+            # Start new order
+            print(f"[frame_to_minio] Starting new order: {order_id}")
+            _current_order_id = order_id
+            _order_frame_count = 0
+        
+        # Upload frame for current order
+        _order_frame_count += 1
+        _last_order_time = time.time()
+        
+        upload_frame(order_id, _order_frame_count, image)
+        
+        if _order_frame_count % 10 == 0:
+            print(f"[frame_to_minio] Order {order_id}: {_order_frame_count} frames")
+        
         return True
 
     except Exception:

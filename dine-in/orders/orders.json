@@ -18,10 +18,10 @@
       "table_number": "T08",
       "ticket_id": "MCD-1002",
       "items_ordered": [
-        { "item": "Cheeseburger", "quantity": 1 },
-        { "item": "Quarter Pounder", "quantity": 1 },
-        { "item": "French Fries", "quantity": 1 },
-        { "item": "Chicken Nuggets", "quantity": 10 }
+        { "item": "Cheese ", "quantity": 1 },
+        { "item": "QP Burger", "quantity": 1 },
+        { "item": "banana ##$", "quantity": 1 },
+        { "item": "McNuggets", "quantity": 10 }
       ]
     },
     {

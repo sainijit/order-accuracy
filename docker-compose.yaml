@@ -30,7 +30,7 @@ services:
     ports:
       - "8001:8000"
     volumes:
-      - ./ovms-service/models_vlm:/models:ro
+      - ./models:/models:ro
       - ./ovms-service/cache:/tmp/ov_cache  # Model compilation cache for faster startup
     environment:
       - OV_CACHE_DIR=/tmp/ov_cache
@@ -42,7 +42,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      - video
+      - "44"   # video group for GPU access
       - "992"  # render group for GPU access
     restart: unless-stopped
     healthcheck:
@@ -169,7 +169,7 @@ services:
       - "8080:8080"
       - "9090:9090"  # Prometheus metrics
     volumes:
-      - ./config:/app/config:ro  # Mount order-accuracy config with orders.json and inventory.json
+      - ./dine-in/orders:/app/config:ro  # Mount dine-in orders and inventory files
     environment:
       - SERVICE_NAME=semantic-comparison-service
       - LOG_LEVEL=INFO
@@ -198,6 +198,37 @@ services:
     profiles:
       - ovms  # Only start when using OVMS backend
 
+  # RTSP Streamer - Converts video files to RTSP streams
+  rtsp-streamer:
+    build:
+      context: ./rtsp-streamer
+      args:
+        http_proxy: http://proxy-pilot.intel.com:912
+        https_proxy: http://proxy-pilot.intel.com:912
+        HTTP_PROXY: http://proxy-pilot.intel.com:912
+        HTTPS_PROXY: http://proxy-pilot.intel.com:912
+        no_proxy: localhost,127.0.0.1
+        NO_PROXY: localhost,127.0.0.1
+    container_name: oa_rtsp_streamer
+    volumes:
+      - ./storage/videos:/media:ro  # Mount videos as read-only
+    environment:
+      - MEDIA_DIR=/media
+      - RTSP_PORT=8554
+    ports:
+      - "8554:8554"  # RTSP port
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8554"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - order-accuracy-net
+    profiles:
+      - parallel  # Start with parallel-pipeline
+
   # Parallel Pipeline Manager - Multi-station processing with autoscaling
   parallel-pipeline:
     build:
@@ -212,7 +243,10 @@ services:
         NO_PROXY: localhost,127.0.0.1
     container_name: oa_parallel_pipeline
     depends_on:
-      - minio
+      rtsp-streamer:
+        condition: service_healthy
+      minio:
+        condition: service_started
     volumes:
       - ./parallel-pipeline:/app:rw  # Mount parallel-pipeline code first
       - ./storage/videos:/videos
@@ -229,8 +263,10 @@ services:
       - USE_SEMANTIC_SERVICE=true
       - PIPELINE_TEST_MODE=true
       - TEST_ORDER_DURATION=30
-      - NO_PROXY=localhost,127.0.0.1,application-service,minio,ovms-vlm,semantic-service,host.docker.internal
-      - no_proxy=localhost,127.0.0.1,application-service,minio,ovms-vlm,semantic-service,host.docker.internal
+      - RTSP_STREAMER_HOST=rtsp-streamer
+      - RTSP_STREAMER_PORT=8554
+      - NO_PROXY=localhost,127.0.0.1,application-service,minio,ovms-vlm,semantic-service,rtsp-streamer,host.docker.internal
+      - no_proxy=localhost,127.0.0.1,application-service,minio,ovms-vlm,semantic-service,rtsp-streamer,host.docker.internal
     command: ["python3", "main.py", "--log-level", "INFO", "fixed", "--stations", "2"]
     restart: unless-stopped
     networks:

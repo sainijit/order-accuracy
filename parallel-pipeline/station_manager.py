@@ -280,6 +280,11 @@ class StationManager:
             'yolo_model_path': self.config.get('yolo_model_path')
         }
         
+        # Pre-create response queue in parent process to ensure it's shared
+        # This must happen BEFORE spawning the worker process
+        self.queue_manager.get_response_queue(station_id)
+        logger.info(f"Pre-created response queue for {station_id} in parent process")
+        
         # Start worker process
         process = mp.Process(
             target=start_worker_process,

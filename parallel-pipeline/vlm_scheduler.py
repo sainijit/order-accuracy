@@ -358,7 +358,13 @@ class VLMScheduler:
                 response_queue = self.queue_manager.get_response_queue(
                     request.station_id
                 )
+                logger.info(
+                    f"[VLM-RESPONSE] Sending response to {request.station_id}: "
+                    f"request_id={response.request_id}, success={response.success}, "
+                    f"items={len(response.detected_items)}"
+                )
                 response_queue.put(response.to_dict())
+                logger.info(f"[VLM-RESPONSE] Response queued for {request.station_id}")
             
             except Exception as e:
                 logger.error(

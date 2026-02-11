@@ -1,9 +1,19 @@
 import subprocess
 import os, io
 import threading
+import logging
 from minio import Minio
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 def build_gstreamer_pipeline(source_type: str, source: str) -> str:
+    logger.debug(f"Building GStreamer pipeline: source_type={source_type}, source={source}")
     if source_type == "file":
         src = f"filesrc location={source}"
 
@@ -18,6 +28,7 @@ def build_gstreamer_pipeline(source_type: str, source: str) -> str:
         src = f"souphttpsrc location={source}"
 
     else:
+        logger.error(f"Unsupported source_type: {source_type}")
         raise ValueError(f"Unsupported source_type: {source_type}")
 
     pipeline = (
@@ -31,17 +42,42 @@ def build_gstreamer_pipeline(source_type: str, source: str) -> str:
         "! fakesink sync=false"
     )
 
+    logger.info(f"GStreamer pipeline built: {pipeline[:100]}...")
     return pipeline
 
 def run_pipeline(source_type: str, source: str):
+    logger.info(f"Starting pipeline execution: source_type={source_type}, source={source}")
     pipeline = build_gstreamer_pipeline(source_type, source)
 
     cmd = f"gst-launch-1.0 -v -e {pipeline}"
+    logger.debug(f"Executing GStreamer command: {cmd[:150]}...")
 
-    subprocess.run(cmd, shell=True, check=True)
+    # Explicitly pass environment to ensure PYTHONPATH is set for gvapython
+    env = os.environ.copy()
     
-      # 🔔 EOS MARKER (CRITICAL)
-    print("[application] Pipeline finished. Writing EOS marker.")
+    # Ensure application-service/app is in PYTHONPATH for gvapython to find frame_pipeline
+    pythonpath = env.get('PYTHONPATH', '')
+    app_dir = '/app/application-service/app'
+    if app_dir not in pythonpath:
+        env['PYTHONPATH'] = f"{app_dir}:{pythonpath}" if pythonpath else app_dir
+        logger.debug(f"Updated PYTHONPATH for subprocess: {env['PYTHONPATH']}")
+
+    try:
+        # Run with explicit environment and working directory
+        subprocess.run(
+            cmd, 
+            shell=True, 
+            check=True, 
+            env=env,
+            cwd='/app/application-service/app'  # Set working directory for imports
+        )
+        logger.info("GStreamer pipeline completed successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"GStreamer pipeline failed with exit code {e.returncode}")
+        raise
+    
+    # 🔔 EOS MARKER (CRITICAL)
+    logger.info("Pipeline finished. Writing EOS marker to MinIO")
 
     client = Minio(
         "minio:9000",
@@ -50,21 +86,27 @@ def run_pipeline(source_type: str, source: str):
         secure=False,
     )
 
-    client.put_object(
-        "frames",
-        "__EOS__",
-        io.BytesIO(b"done"),
-        length=4,
-        content_type="text/plain",
-    )
+    try:
+        client.put_object(
+            "frames",
+            "__EOS__",
+            io.BytesIO(b"done"),
+            length=4,
+            content_type="text/plain",
+        )
+        logger.info("EOS marker written successfully to frames bucket")
+    except Exception as e:
+        logger.error(f"Failed to write EOS marker: {e}")
 
 def run_pipeline_async(source_type: str, source: str):
+    logger.info(f"Starting pipeline in background thread: source_type={source_type}")
     t = threading.Thread(
         target=run_pipeline,
         args=(source_type, source),
         daemon=True
     )
     t.start()
+    logger.debug(f"Pipeline thread started: thread_id={t.ident}")
 
 def normalize_rtsp_url(url: str) -> str:
     if url.startswith("rtsp://localhost"):

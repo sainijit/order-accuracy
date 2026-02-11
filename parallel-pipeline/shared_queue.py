@@ -75,7 +75,9 @@ class VLMResponse:
         detected_items: list,
         inference_time: float,
         success: bool = True,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        tracking_id: Optional[str] = None,
+        total_latency: Optional[float] = None
     ):
         self.request_id = request_id
         self.station_id = station_id
@@ -84,6 +86,8 @@ class VLMResponse:
         self.inference_time = inference_time
         self.success = success
         self.error = error
+        self.tracking_id = tracking_id
+        self.total_latency = total_latency
     
     def to_dict(self) -> Dict:
         """Serialize for queue transmission"""
@@ -94,7 +98,9 @@ class VLMResponse:
             'detected_items': self.detected_items,
             'inference_time': self.inference_time,
             'success': self.success,
-            'error': self.error
+            'error': self.error,
+            'tracking_id': self.tracking_id,
+            'total_latency': self.total_latency
         }
     
     @classmethod
@@ -107,7 +113,9 @@ class VLMResponse:
             detected_items=data['detected_items'],
             inference_time=data['inference_time'],
             success=data.get('success', True),
-            error=data.get('error')
+            error=data.get('error'),
+            tracking_id=data.get('tracking_id'),
+            total_latency=data.get('total_latency')
         )
 
 
@@ -125,15 +133,21 @@ class SharedQueue:
         backend: QueueBackend = QueueBackend.MULTIPROCESSING,
         redis_host: str = "localhost",
         redis_port: int = 6379,
-        maxsize: int = 1000
+        maxsize: int = 1000,
+        mp_manager: Optional[Any] = None
     ):
         self.name = name
         self.backend = backend
         self.maxsize = maxsize
         
         if backend == QueueBackend.MULTIPROCESSING:
-            self._queue = mp.Queue(maxsize=maxsize)
-            logger.info(f"Initialized multiprocessing queue: {name} (maxsize={maxsize})")
+            # Use Manager.Queue() for cross-process sharing, or mp.Queue() if no manager
+            if mp_manager:
+                self._queue = mp_manager.Queue(maxsize=maxsize)
+                logger.info(f"Initialized managed multiprocessing queue: {name} (maxsize={maxsize})")
+            else:
+                self._queue = mp.Queue(maxsize=maxsize)
+                logger.info(f"Initialized multiprocessing queue: {name} (maxsize={maxsize})")
         
         elif backend == QueueBackend.REDIS:
             try:
@@ -232,13 +246,21 @@ class QueueManager:
         self.redis_host = redis_host
         self.redis_port = redis_port
         
+        # For multiprocessing backend, create a Manager to share queues across processes
+        if backend == QueueBackend.MULTIPROCESSING:
+            self.mp_manager = mp.Manager()
+            logger.info("Created multiprocessing.Manager() for cross-process queue sharing")
+        else:
+            self.mp_manager = None
+        
         # Central VLM request queue
         self.vlm_request_queue = SharedQueue(
             name="vlm_requests",
             backend=backend,
             redis_host=redis_host,
             redis_port=redis_port,
-            maxsize=500
+            maxsize=500,
+            mp_manager=self.mp_manager
         )
         
         # Per-station response queues
@@ -250,7 +272,8 @@ class QueueManager:
             backend=backend,
             redis_host=redis_host,
             redis_port=redis_port,
-            maxsize=1000
+            maxsize=1000,
+            mp_manager=self.mp_manager
         )
         
         # Control queue for shutdown signals
@@ -259,7 +282,8 @@ class QueueManager:
             backend=backend,
             redis_host=redis_host,
             redis_port=redis_port,
-            maxsize=100
+            maxsize=100,
+            mp_manager=self.mp_manager
         )
         
         logger.info(f"QueueManager initialized with {backend.value} backend")
@@ -272,7 +296,8 @@ class QueueManager:
                 backend=self.backend,
                 redis_host=self.redis_host,
                 redis_port=self.redis_port,
-                maxsize=100
+                maxsize=100,
+                mp_manager=self.mp_manager
             )
         return self.response_queues[station_id]
     

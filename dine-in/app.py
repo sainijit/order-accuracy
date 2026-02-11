@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import json
+import logging
+import requests
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
+from io import BytesIO
 
 import gradio as gr
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# API Configuration
+API_BASE_URL = "http://localhost:8080/api"
 
 
 @dataclass(frozen=True)
@@ -205,10 +220,92 @@ def load_scenario(name: str) -> Tuple[str, Dict[str, object]]:
 
 
 def validate_plate(name: str) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """
+    Validate plate by calling the FastAPI endpoint.
+    
+    Args:
+        name: Scenario name/identifier
+        
+    Returns:
+        Tuple of (validation_result, metrics)
+    """
+    logger.info(f"[GRADIO] validate_plate called with name: {name}")
+    
     scenario = _SCENARIOS.get(name)
     if not scenario:
+        logger.warning(f"[GRADIO] No scenario found for: {name}")
         return _default_validation(name), _default_metrics(name)
-    return scenario.validation, scenario.metrics
+    
+    # Check if image exists
+    if not scenario.image_path.exists():
+        logger.warning(f"[GRADIO] Image not found: {scenario.image_path}")
+        return _default_validation(name), _default_metrics(name)
+    
+    try:
+        logger.info(f"[GRADIO] Calling API for validation...")
+        
+        # Prepare order data from scenario manifest
+        # Map items_ordered from JSON to items for API
+        order_items = scenario.order_manifest.get("items_ordered", [])
+        api_items = [{"name": item.get("item"), "quantity": item.get("quantity")} for item in order_items]
+        
+        order_data = {
+            "order_id": scenario.order_manifest.get("image_id", name),
+            "table_number": scenario.order_manifest.get("table_number", ""),
+            "restaurant": scenario.order_manifest.get("restaurant", ""),
+            "items": api_items,
+            "modifiers": scenario.order_manifest.get("modifiers", [])
+        }
+        
+        logger.info(f"[GRADIO] Order has {len(api_items)} expected items: {[item['name'] for item in api_items]}")
+        
+        logger.debug(f"[GRADIO] Order data: {order_data}")
+        
+        # Open and send image file
+        with open(scenario.image_path, 'rb') as image_file:
+            files = {'image': (scenario.image_path.name, image_file, 'image/png')}
+            data = {'order': json.dumps(order_data)}
+            
+            logger.info(f"[GRADIO] Sending POST request to {API_BASE_URL}/validate")
+            
+            # Call FastAPI validation endpoint
+            response = requests.post(
+                f"{API_BASE_URL}/validate",
+                files=files,
+                data=data,
+                timeout=30
+            )
+        
+        logger.info(f"[GRADIO] API Response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"[GRADIO] API returned successful validation: {result.get('validation_id')}")
+            
+            # Extract validation and metrics
+            validation = {
+                "order_complete": result.get("order_complete", False),
+                "missing_items": result.get("missing_items", []),
+                "extra_items": result.get("extra_items", []),
+                "modifier_validation": result.get("modifier_validation", {}),
+                "accuracy_score": result.get("accuracy_score", 0.0)
+            }
+            
+            metrics = result.get("metrics", _default_metrics(name))
+            
+            return validation, metrics
+        else:
+            logger.error(f"[GRADIO] API error: {response.status_code} - {response.text}")
+            # Fallback to predefined profiles on error
+            return scenario.validation, scenario.metrics
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[GRADIO] Request failed: {e}")
+        # Fallback to predefined profiles on connection error
+        return scenario.validation, scenario.metrics
+    except Exception as e:
+        logger.exception(f"[GRADIO] Validation error: {e}")
+        return _default_validation(name), _default_metrics(name)
 
 
 with gr.Blocks(
@@ -271,6 +368,10 @@ with gr.Blocks(
             "vlm_inference_ms": None,
             "agent_reconciliation_ms": None,
             "within_operational_window": None,
+            "cpu_utilization": None,
+            "gpu_utilization": None,
+            "memory_utilization": None,
+            "gpu_memory_utilization": None
         }
         return image_path, order_manifest, empty_validation, empty_metrics
 
@@ -303,4 +404,8 @@ with gr.Blocks(
         metrics_display.value = initial_metrics
 
 if __name__ == "__main__":
-    app.launch()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )

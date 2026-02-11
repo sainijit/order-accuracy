@@ -1,10 +1,10 @@
-# Video sources (can be RTSP streams or file paths)
-# Using file sources from application.yaml for testing
+# Video sources (RTSP streams from rtsp-streamer service)
+# Stream names match video filenames: video1.mp4 -> stream: video1
 rtsp_urls:
-  - /videos/video1.mp4
-  - /videos/video2.mp4
-  - /videos/video1.mp4
-  - /videos/video1.mp4
+  - rtsp://rtsp-streamer:8554/video1  # Station 1
+  - rtsp://rtsp-streamer:8554/video2  # Station 2
+  - rtsp://rtsp-streamer:8554/video1  # Station 3 (reuses video1)
+  - rtsp://rtsp-streamer:8554/video2  # Station 4 (reuses video2)
 
 # Model paths
 yolo_model_path: ../model/yolo11n_openvino_model
@@ -28,7 +28,7 @@ control_loop_interval: 5.0
 # VLM configuration
 vlm:
   ovms_url: http://ovms-vlm:8000  # Docker network hostname
-  model_name: Qwen/Qwen2.5-VL-7B-Instruct-ov-int8  # Must match OVMS config.json
+  model_name: Qwen/Qwen2.5-VL-7B-Instruct  # Must match OVMS config.json
   batch_window_ms: 100
   max_batch_size: 16
   max_workers: 4

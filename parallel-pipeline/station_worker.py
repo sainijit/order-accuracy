@@ -130,7 +130,15 @@ class StationWorker:
             # Start persistent GStreamer pipeline (subprocess)
             self._start_persistent_pipeline()
             
-            # Start monitoring threads
+            # Wait for pipeline to be ready before processing video
+            if not self._wait_for_pipeline_ready(timeout=15.0):
+                logger.error(
+                    f"[{self.station_id}] Pipeline failed to start properly, "
+                    f"aborting worker"
+                )
+                return
+            
+            # Start monitoring threads (only after pipeline is verified)
             self._start_frame_monitor()
             self._start_health_monitor()
             
@@ -257,7 +265,8 @@ class StationWorker:
         
         # Prepare environment
         env = os.environ.copy()
-        app_dir = '/app/application-service/app'
+        # Use local parallel-pipeline directory for frame_pipeline module
+        app_dir = '/app'
         pythonpath = env.get('PYTHONPATH', '')
         if app_dir not in pythonpath:
             env['PYTHONPATH'] = f"{app_dir}:{pythonpath}" if pythonpath else app_dir
@@ -269,14 +278,14 @@ class StationWorker:
         
         try:
             # Start subprocess with process group for clean shutdown
-            # Use DEVNULL for output to prevent pipe blocking
+            # Capture stderr for debugging RTSP/GStreamer issues
             self._pipeline_subprocess = subprocess.Popen(
                 cmd,
                 shell=True,
                 env=env,
-                cwd='/app/application-service/app',
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                cwd='/app',  # Use parallel-pipeline directory
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 preexec_fn=os.setsid  # Create process group
             )
             
@@ -290,6 +299,53 @@ class StationWorker:
         except Exception as e:
             logger.error(f"[{self.station_id}] Failed to start persistent pipeline: {e}")
             raise
+    
+    def _wait_for_pipeline_ready(self, timeout: float = 10.0) -> bool:
+        """
+        Wait for GStreamer pipeline to be ready and healthy.
+        
+        Verifies the pipeline subprocess is running and stable before
+        allowing frame processing to begin.
+        
+        Args:
+            timeout: Maximum time to wait for pipeline readiness (seconds)
+            
+        Returns:
+            True if pipeline is ready, False if failed to start
+        """
+        logger.info(f"[{self.station_id}] Waiting for pipeline to be ready...")
+        
+        # Check pipeline is running for at least 5 seconds without crashing
+        check_interval = 0.5
+        stable_time = 5.0  # Pipeline must run stable for 5 seconds
+        start_time = time.time()
+        
+        while time.time() - start_time < stable_time:
+            if not self._pipeline_subprocess:
+                logger.error(f"[{self.station_id}] Pipeline subprocess not initialized")
+                return False
+            
+            returncode = self._pipeline_subprocess.poll()
+            if returncode is not None:
+                logger.error(
+                    f"[{self.station_id}] Pipeline crashed during startup "
+                    f"(exit code: {returncode})"
+                )
+                return False
+            
+            time.sleep(check_interval)
+            
+            if time.time() - start_time > timeout:
+                logger.error(
+                    f"[{self.station_id}] Pipeline readiness timeout after {timeout}s"
+                )
+                return False
+        
+        logger.info(
+            f"[{self.station_id}] Pipeline is ready and stable "
+            f"(verified for {stable_time}s)"
+        )
+        return True
     
     def _build_persistent_gstreamer_pipeline(self) -> str:
         """
@@ -387,9 +443,14 @@ class StationWorker:
                         output = ""
                         try:
                             # Read whatever is available (non-blocking)
-                            output = self._pipeline_subprocess.stdout.read()
-                        except Exception:
-                            pass
+                            stdout_data = self._pipeline_subprocess.stdout.read() if self._pipeline_subprocess.stdout else b""
+                            stderr_data = self._pipeline_subprocess.stderr.read() if self._pipeline_subprocess.stderr else b""
+                            if stdout_data:
+                                output += f"STDOUT:\n{stdout_data.decode('utf-8', errors='ignore')}\n"
+                            if stderr_data:
+                                output += f"STDERR:\n{stderr_data.decode('utf-8', errors='ignore')}\n"
+                        except Exception as e:
+                            logger.warning(f"[{self.station_id}] Could not read pipeline output: {e}")
                         
                         logger.error(
                             f"[{self.station_id}] Pipeline subprocess died "
@@ -545,19 +606,28 @@ class StationWorker:
             self.metrics_store.increment_failures()
             return
         
+        # Extract tracking_id from VLM response
+        tracking_id = getattr(vlm_response, 'tracking_id', f"{self.station_id}_{order_id}_unknown")
+        vlm_inference_time = getattr(vlm_response, 'inference_time', 0.0)
+        total_vlm_latency = getattr(vlm_response, 'total_latency', 0.0)
+        
         # Order validation
-        validation_result = self._validate_order(vlm_response.detected_items, order_id)
+        validation_result = self._validate_order(vlm_response.detected_items, order_id, tracking_id)
         
         # Record metrics
         order_latency = time.time() - order_start_time
+        validation_latency = validation_result.get('validation_latency', 0.0)
+        
         self.metrics_store.record_latency(self.station_id, order_latency)
         self.metrics_store.increment_throughput(self.station_id)
         
         logger.info(
-            f"[{self.station_id}] Order {order_id} completed: "
-            f"latency={order_latency:.2f}s, "
-            f"accuracy={validation_result.get('accuracy', 0):.1%} "
-            f"(NO pipeline startup overhead!)"
+            f"[{tracking_id}] [ORDER-COMPLETED] order={order_id}, "
+            f"total_latency={order_latency:.2f}s, "
+            f"accuracy={validation_result.get('accuracy', 0):.1%}, "
+            f"vlm_inference={vlm_inference_time:.2f}s, "
+            f"total_vlm_latency={total_vlm_latency:.2f}s, "
+            f"validation_latency={validation_latency:.2f}s"
         )
     
     def _load_order_frames_from_minio(self, order_id: str) -> List:
@@ -675,6 +745,9 @@ class StationWorker:
         Returns:
             VLMResponse or None if failed
         """
+        # Generate timestamp once for consistent ID generation
+        vlm_request_start = time.time()
+        
         # Serialize frames (base64 encode)
         import base64
         serialized_frames = []
@@ -687,19 +760,23 @@ class StationWorker:
                     'timestamp': frame.get('timestamp', time.time())
                 })
         
-        # Create VLM request
+        # Create VLM request (this will generate request_id from timestamp)
         request = VLMRequest(
             station_id=self.station_id,
             order_id=order_id,
             frames=serialized_frames,
-            timestamp=time.time()
+            timestamp=vlm_request_start
         )
+        
+        # Use the same tracking ID as request_id for consistency
+        tracking_id = request.request_id
         
         # Send to scheduler
         self.queue_manager.vlm_request_queue.put(request.to_dict())
         
-        logger.debug(
-            f"[{self.station_id}] Sent VLM request: {request.request_id} with {len(serialized_frames)} frames"
+        logger.info(
+            f"[{tracking_id}] [VLM-REQUEST-SENT] order={order_id}, frames={len(serialized_frames)}, "
+            f"request_id={request.request_id}, timestamp={vlm_request_start:.3f}"
         )
         
         # Wait for response (with timeout)
@@ -717,11 +794,25 @@ class StationWorker:
                 
                 # Verify response matches request
                 if response.request_id == request.request_id:
-                    logger.debug(
-                        f"[{self.station_id}] Received VLM response: "
-                        f"{len(response.detected_items)} items detected"
-                    )
-                    return response
+                    vlm_total_latency = time.time() - vlm_request_start
+                    
+                    if response.success:
+                        logger.info(
+                            f"[{tracking_id}] [VLM-RESPONSE-RECEIVED] order={order_id}, "
+                            f"items={len(response.detected_items)}, "
+                            f"vlm_inference_time={response.inference_time:.3f}s, "
+                            f"total_vlm_latency={vlm_total_latency:.3f}s"
+                        )
+                        # Store tracking_id and latency in response for downstream use
+                        response.tracking_id = tracking_id
+                        response.total_latency = vlm_total_latency
+                        return response
+                    else:
+                        logger.error(
+                            f"[{tracking_id}] [VLM-RESPONSE-FAILED] order={order_id}, "
+                            f"error={response.error}, latency={vlm_total_latency:.3f}s"
+                        )
+                        return None
                 else:
                     logger.warning(
                         f"[{self.station_id}] Response mismatch: "
@@ -731,12 +822,14 @@ class StationWorker:
             except queue.Empty:
                 continue
         
+        vlm_timeout_latency = time.time() - vlm_request_start
         logger.error(
-            f"[{self.station_id}] VLM response timeout after {timeout}s"
+            f"[{tracking_id}] [VLM-RESPONSE-TIMEOUT] order={order_id}, "
+            f"timeout={timeout}s, waited={vlm_timeout_latency:.3f}s"
         )
         return None
     
-    def _validate_order(self, detected_items: List[str], order_id: str) -> Dict:
+    def _validate_order(self, detected_items: List[str], order_id: str, tracking_id: str = None) -> Dict:
         """
         Validate detected items against expected order.
         
@@ -745,6 +838,7 @@ class StationWorker:
         Args:
             detected_items: Items detected by VLM
             order_id: Order ID being validated
+            tracking_id: Unique tracking ID for latency measurement
         
         Returns:
             Validation result dict with accuracy, missing items, etc.
@@ -762,9 +856,15 @@ class StationWorker:
         
         # Use existing validation logic
         try:
+            # Generate tracking ID if not provided
+            if not tracking_id:
+                tracking_id = f"{self.station_id}_{order_id}_{int(time.time() * 1000)}"
+            
+            validation_start_time = time.time()
+            
             # Get expected items for this order
-            order = self._orders.get(str(order_id), {})
-            expected_items = order.get('items', [])
+            # orders.json format: { "order_id": [ {name, quantity}, ... ] }
+            expected_items = self._orders.get(str(order_id), [])
             
             # Convert detected_items (list of strings/dicts) to expected format
             detected_formatted = []
@@ -774,11 +874,27 @@ class StationWorker:
                 else:
                     detected_formatted.append({'name': item, 'quantity': 1})
             
+            logger.info(
+                f"[{tracking_id}] [VALIDATION-INPUT] order={order_id}, "
+                f"expected={expected_items}, detected={detected_formatted}, "
+                f"timestamp={validation_start_time:.3f}"
+            )
+            
             # Call validate_order function (no VLM pipeline needed - semantic matching is internal)
             result = self._validation_func(
                 expected_items=expected_items,
                 detected_items=detected_formatted,
                 vlm_pipeline=None  # Not used with semantic service
+            )
+            
+            validation_end_time = time.time()
+            validation_latency = validation_end_time - validation_start_time
+            
+            logger.info(
+                f"[{tracking_id}] [VALIDATION-OUTPUT] order={order_id}, "
+                f"missing={result.get('missing', [])}, extra={result.get('extra', [])}, "
+                f"qty_mismatch={result.get('quantity_mismatches', [])}, "
+                f"validation_latency={validation_latency:.3f}s"
             )
             
             # Add accuracy calculation
@@ -792,8 +908,13 @@ class StationWorker:
             result['order_id'] = order_id
             result['accuracy'] = accuracy
             result['detected_items'] = detected_formatted
+            result['validation_latency'] = validation_latency
+            result['tracking_id'] = tracking_id
             
-            logger.debug(f"[{self.station_id}] Validation result: accuracy={accuracy:.2%}")
+            logger.debug(
+                f"[{tracking_id}] Validation complete: accuracy={accuracy:.2%}, "
+                f"latency={validation_latency:.3f}s"
+            )
             return result
         except Exception as e:
             logger.error(f"[{self.station_id}] Validation error: {e}")
