@@ -71,7 +71,7 @@ class ConfigManager:
             ovms_model_name=os.getenv("OVMS_MODEL_NAME", "Qwen/Qwen2.5-VL-7B-Instruct-ov-int8"),
             semantic_service_endpoint=os.getenv("SEMANTIC_SERVICE_ENDPOINT", "http://semantic-service:8080"),
             metrics_collector_endpoint=os.getenv("METRICS_COLLECTOR_ENDPOINT", "http://metrics-collector:8084"),
-            api_timeout=int(os.getenv("API_TIMEOUT", "60"))
+            api_timeout=int(os.getenv("API_TIMEOUT", "300"))  # Extended for 7B model with inventory
         )
         
         benchmark_config = BenchmarkConfig(

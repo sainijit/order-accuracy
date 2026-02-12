@@ -38,7 +38,8 @@ APP_DESCRIPTION = (
     "and latency instrumentation aligned to the two-second service window."
 )
 
-ROOT_DIR = Path(__file__).resolve().parent
+# Since app.py is in /app/src/, go up one level to /app/
+ROOT_DIR = Path(__file__).resolve().parent.parent
 IMAGES_DIR = ROOT_DIR / "images"
 CONFIGS_DIR = ROOT_DIR / "configs"
 ORDERS_PATH = CONFIGS_DIR / "orders.json"
@@ -186,7 +187,7 @@ def _load_orders() -> Dict[str, Scenario]:
         if not image_id:
             continue
 
-        image_path = IMAGES_DIR / f"{image_id}.png"
+        image_path = IMAGES_DIR / f"{image_id}.jpg"
         manifest = {
             key: value
             for key, value in order.items()
@@ -270,12 +271,12 @@ def validate_plate(name: str) -> Tuple[Dict[str, object], Dict[str, object]]:
             
             logger.info(f"[GRADIO] Sending POST request to {API_BASE_URL}/validate")
             
-            # Call FastAPI validation endpoint
+            # Call FastAPI validation endpoint (extended timeout for 7B model with inventory)
             response = requests.post(
                 f"{API_BASE_URL}/validate",
                 files=files,
                 data=data,
-                timeout=30
+                timeout=320  # 5+ minutes for 7B model inference
             )
         
         logger.info(f"[GRADIO] API Response status: {response.status_code}")

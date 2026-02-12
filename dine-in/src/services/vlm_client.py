@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 from io import BytesIO
 import httpx
@@ -103,7 +104,28 @@ class VLMClient:
         self.model_name = model_name
         self.timeout = timeout
         self.chat_endpoint = f"{endpoint}/v3/chat/completions"
-        logger.info(f"VLM Client initialized: endpoint={endpoint}, model={model_name}")
+        self.inventory_items = self._load_inventory()
+        logger.info(f"VLM Client initialized: endpoint={endpoint}, model={model_name}, inventory_items={len(self.inventory_items)}")
+    
+    def _load_inventory(self) -> List[str]:
+        """Load inventory items from inventory.json"""
+        try:
+            # Since vlm_client.py is in /app/src/services/, go up to /app/
+            base_dir = Path(__file__).resolve().parent.parent.parent
+            inventory_path = base_dir / "configs" / "inventory.json"
+            
+            if not inventory_path.exists():
+                logger.warning(f"Inventory file not found at {inventory_path}, using empty inventory")
+                return []
+            
+            with open(inventory_path, 'r') as f:
+                items = json.load(f)
+            
+            logger.info(f"Loaded {len(items)} inventory items from {inventory_path}")
+            return items
+        except Exception as e:
+            logger.error(f"Error loading inventory: {e}")
+            return []
     
     def _encode_image(self, image_bytes: bytes) -> str:
         """Encode image to base64 for VLM input"""
@@ -120,8 +142,32 @@ class VLMClient:
             raise
     
     def _build_prompt(self) -> str:
-        """Build structured prompt for food plate analysis"""
-        return """Analyze this food plate image carefully. List all food items you can identify with their quantities.
+        """Build inventory-aware structured prompt for food plate analysis"""
+        # Format inventory items as numbered list
+        if self.inventory_items:
+            inventory_text = "\n".join([f"  {i+1}. {item}" for i, item in enumerate(self.inventory_items)])
+            prompt = f"""Analyze this food plate image carefully and recognize products ONLY from this inventory list:
+
+{inventory_text}
+
+Rules:
+- Always choose the closest matching inventory item name (exact case-sensitive match preferred)
+- Never invent new product names outside the inventory list
+- If you see an item similar to one in inventory, use the inventory name
+- Count quantities accurately
+
+Return the result as a JSON object with this exact structure:
+{{
+  "items": [
+    {{"name": "exact_inventory_item_name", "quantity": number}},
+    ...
+  ]
+}}
+
+If no inventory items are visible in the image, return: {{"items": []}}"""
+        else:
+            # Fallback if inventory not loaded
+            prompt = """Analyze this food plate image carefully. List all food items you can identify with their quantities.
 
 Return the result as a JSON object with this exact structure:
 {
@@ -131,8 +177,11 @@ Return the result as a JSON object with this exact structure:
   ]
 }
 
-Be specific with item names. For example, use "french fries" instead of just "fries", "chicken burger" instead of just "burger".
-Count quantities accurately."""
+Be specific with item names. Count quantities accurately."""
+        
+        logger.info(f"[PROMPT] Built prompt with {len(self.inventory_items)} inventory items")
+        logger.info(f"[PROMPT] Full prompt: {prompt}")
+        return prompt
     
     async def analyze_plate(self, image_bytes: bytes, request_id: str = None) -> VLMResponse:
         """
@@ -172,9 +221,15 @@ Count quantities accurately."""
                 "temperature": 0.1  # Low temperature for consistent structured output
             }
             
-            # Make async request
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                logger.info(f"[VLM_REQUEST] Sending to OVMS for {req_id}")
+            # Make async request with extended timeout for 7B model
+            # Use separate timeouts: connect=10s, read=300s for long inference
+            timeout_config = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+            logger.info(f"[VLM_REQUEST] Endpoint: {self.chat_endpoint}")
+            logger.info(f"[VLM_REQUEST] Model: {self.model_name}")
+            logger.info(f"[VLM_REQUEST] Timeout config: connect=10s, read=300s")
+            
+            async with httpx.AsyncClient(timeout=timeout_config) as client:
+                logger.info(f"[VLM_REQUEST] Sending POST to {self.chat_endpoint} for {req_id}")
                 request_sent_time = time.time()
                 
                 response = await client.post(

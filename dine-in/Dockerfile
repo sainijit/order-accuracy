@@ -32,18 +32,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY app.py .
-COPY api.py .
-COPY config.py .
-COPY main.py .
-COPY services/ ./services/
-COPY images/ ./images/
+# Copy application files from src
+COPY src/ ./src/
 COPY configs/ ./configs/
 
 # Expose ports
 EXPOSE 7860
 EXPOSE 8080
 
-# Run the combined application
-CMD ["python", "main.py"]
+# Run the combined application from src directory
+CMD ["python", "src/main.py"]

@@ -86,6 +86,8 @@ services:
     ports:
       - "7861:7860"  # Gradio UI
       - "8083:8080"  # FastAPI
+    volumes:
+      - ./images:/app/images:ro
     environment:
       - SEMANTIC_SERVICE_ENDPOINT=http://semantic-service:8080
       - OVMS_ENDPOINT=http://ovms-vlm:8000

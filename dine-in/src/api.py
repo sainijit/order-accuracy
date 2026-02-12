@@ -217,8 +217,10 @@ async def get_orders():
     Returns a mapping of order_id to order details.
     """
     try:
-        configs_dir = Path(__file__).resolve().parent / "configs"
-        images_dir = Path(__file__).resolve().parent / "images"
+        # Since api.py is in /app/src/, go up one level to /app/
+        base_dir = Path(__file__).resolve().parent.parent
+        configs_dir = base_dir / "configs"
+        images_dir = base_dir / "images"
         orders_file = configs_dir / "orders.json"
         
         if not orders_file.exists():
@@ -538,8 +540,9 @@ async def start_benchmark(background_tasks: BackgroundTasks):
     
     try:
         # Load test images and orders
-        images_dir = Path("images")
-        orders_dir = Path("orders")
+        base_dir = Path(__file__).resolve().parent.parent
+        images_dir = base_dir / "images"
+        orders_dir = base_dir / "orders"
         
         test_images = []
         test_orders = []
