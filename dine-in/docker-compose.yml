@@ -8,7 +8,7 @@ services:
     ports:
       - "8002:8000"  # Changed from 8001 to avoid conflict
     volumes:
-      - ../models:/models:ro
+      - ../ovms-service/models:/models:ro
       - ../ovms-service/cache:/tmp/ov_cache
     environment:
       - OV_CACHE_DIR=/tmp/ov_cache
@@ -35,13 +35,14 @@ services:
   # Note: This service is optional and disabled by default since the dine-in app
   # uses pre-configured validation results. To enable, run with --profile with-semantic
   semantic-service:
-    image: semantic-comparison-service:latest
+    image: semantic-search-agent:latest
     container_name: dinein_semantic_service
     ports:
       - "8081:8080"  # Changed from 8080 to avoid conflict
       - "9091:9090"  # Changed from 9090 to avoid conflict
     volumes:
       - ../config:/app/config:ro
+      - ./configs:/app/configs:ro
     environment:
       - SERVICE_NAME=semantic-comparison-service
       - LOG_LEVEL=INFO
@@ -52,8 +53,8 @@ services:
       - CACHE_BACKEND=memory
       - PROMETHEUS_ENABLED=true
       - CONFIG_DIR=/app/config
-      - ORDERS_FILE=/app/config/orders.json
-      - INVENTORY_FILE=/app/config/inventory.json
+      - ORDERS_FILE=/app/configs/orders.json
+      - INVENTORY_FILE=/app/configs/inventory.json
       - NO_PROXY=localhost,127.0.0.1,ovms-vlm,semantic-service,dine-in,host.docker.internal
       - no_proxy=localhost,127.0.0.1,ovms-vlm,semantic-service,dine-in,host.docker.internal
     depends_on:
@@ -68,8 +69,6 @@ services:
       start_period: 10s
     networks:
       - dinein-net
-    profiles:
-      - with-semantic  # Optional profile
 
   # Dine-In Order Accuracy Gradio UI
   dine-in:
@@ -88,11 +87,11 @@ services:
       - "7861:7860"  # Gradio UI
       - "8083:8080"  # FastAPI
     environment:
-      - SEMANTIC_SERVICE_ENDPOINT=http://oa_semantic_service:8080
+      - SEMANTIC_SERVICE_ENDPOINT=http://semantic-service:8080
       - OVMS_ENDPOINT=http://ovms-vlm:8000
       - METRICS_COLLECTOR_ENDPOINT=http://metrics-collector:8084
-      - NO_PROXY=localhost,127.0.0.1,ovms-vlm,semantic-service,metrics-collector,oa_semantic_service,host.docker.internal,172.17.0.1
-      - no_proxy=localhost,127.0.0.1,ovms-vlm,semantic-service,metrics-collector,oa_semantic_service,host.docker.internal,172.17.0.1
+      - NO_PROXY=localhost,127.0.0.1,ovms-vlm,semantic-service,metrics-collector,host.docker.internal,172.17.0.1
+      - no_proxy=localhost,127.0.0.1,ovms-vlm,semantic-service,metrics-collector,host.docker.internal,172.17.0.1
     depends_on:
       ovms-vlm:
         condition: service_healthy

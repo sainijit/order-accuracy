@@ -35,9 +35,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application files
 COPY app.py .
 COPY api.py .
+COPY config.py .
 COPY main.py .
+COPY services/ ./services/
 COPY images/ ./images/
-COPY orders/ ./orders/
+COPY configs/ ./configs/
 
 # Expose ports
 EXPOSE 7860

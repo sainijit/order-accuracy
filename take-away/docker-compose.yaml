@@ -26,7 +26,7 @@ services:
     ports:
       - "8001:8000"
     volumes:
-      - ./models:/models:ro
+      - ./ovms-service/models:/models:ro
       - ./ovms-service/cache:/tmp/ov_cache
     environment:
       - OV_CACHE_DIR=/tmp/ov_cache
@@ -77,8 +77,8 @@ services:
       - ./datasets:/datasets:ro
     environment:
       # Service mode configuration
-      SERVICE_MODE: ${SERVICE_MODE:-parallel}  # 'single' or 'parallel'
-      WORKERS: ${WORKERS:-4}                   # Number of station workers (processes)
+      SERVICE_MODE: ${SERVICE_MODE:-single}  # 'single' or 'parallel' - default: single (UI-only, no background workers)
+      WORKERS: ${WORKERS:-0}                   # Number of station workers - 0 means no background processing, only on-demand via UI uploads
       SCALING_MODE: ${SCALING_MODE:-fixed}    # 'fixed' or 'auto' for parallel mode
       
       # Common configuration
@@ -116,7 +116,6 @@ services:
       - "8000:8000"  # Exposed for monitoring/API access
     depends_on:
       - minio
-      - rtsp-streamer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     cpus: 4
@@ -177,7 +176,7 @@ services:
 
   # Semantic Comparison Service
   semantic-service:
-    image: semantic-comparison-service:latest
+    image: semantic-search-agent:latest
     container_name: oa_semantic_service
     ports:
       - "8080:8080"
@@ -185,7 +184,7 @@ services:
     volumes:
       - ./config:/app/config:ro
     environment:
-      - SERVICE_NAME=semantic-comparison-service
+      - SERVICE_NAME=semantic-search-agent
       - LOG_LEVEL=INFO
       - VLM_BACKEND=ovms
       - OVMS_ENDPOINT=http://ovms-vlm:8000
@@ -222,6 +221,8 @@ services:
         no_proxy: localhost,127.0.0.1
         NO_PROXY: localhost,127.0.0.1
     container_name: oa_rtsp_streamer
+    profiles:
+      - parallel  # Only start this service in parallel mode
     volumes:
       - ./storage/videos:/media:ro  # Mount videos as read-only
     environment:

@@ -245,7 +245,8 @@ class VLMComponent:
 
 # OVMS backend configuration
 backend_config = {
-    "ovms_endpoint": os.getenv("OVMS_ENDPOINT", VLM_CFG.get("ovms_endpoint", "http://ovms-vlm:8000")),
+    "ovms_endpoint": os.getenv("OVMS_ENDPOINT", VLM_CFG.get("ovms_endpoint", "http://" \
+    ":8000")),
     "ovms_model": os.getenv("OVMS_MODEL_NAME", VLM_CFG.get("ovms_model", "Qwen/Qwen2.5-VL-7B-Instruct-ov-int8")),
     "timeout_sec": VLM_CFG.get("timeout_sec", 300),
 }

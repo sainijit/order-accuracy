@@ -16,6 +16,7 @@ class ServiceConfig:
     ovms_endpoint: str
     ovms_model_name: str
     semantic_service_endpoint: str
+    metrics_collector_endpoint: str
     api_timeout: int
 
 
@@ -69,6 +70,7 @@ class ConfigManager:
             ovms_endpoint=os.getenv("OVMS_ENDPOINT", "http://ovms-vlm:8000"),
             ovms_model_name=os.getenv("OVMS_MODEL_NAME", "Qwen/Qwen2.5-VL-7B-Instruct-ov-int8"),
             semantic_service_endpoint=os.getenv("SEMANTIC_SERVICE_ENDPOINT", "http://semantic-service:8080"),
+            metrics_collector_endpoint=os.getenv("METRICS_COLLECTOR_ENDPOINT", "http://metrics-collector:8084"),
             api_timeout=int(os.getenv("API_TIMEOUT", "60"))
         )
         

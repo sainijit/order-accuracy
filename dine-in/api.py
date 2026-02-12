@@ -1,362 +1,179 @@
 """
-FastAPI endpoints for Dine-In Order Accuracy Validation
+FastAPI endpoints for Dine-In Order Accuracy Validation.
+Production-ready implementation with proper service architecture.
 """
 
 import json
 import uuid
-import time
 import logging
-import httpx
-import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from io import BytesIO
-import base64
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, BackgroundTasks
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from PIL import Image
 
-# Import validation logic from app.py
-from app import _VALIDATION_PROFILES, _METRIC_PROFILES, _default_validation, _default_metrics
+# Import services and config
+from config import config_manager
+from services import ValidationService, VLMClient, SemanticClient
+from services.benchmark_service import BenchmarkService
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=config_manager.config.log_level,
+    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
-# Service endpoints
-OVMS_ENDPOINT = "http://ovms-vlm:8000"
-SEMANTIC_SERVICE_ENDPOINT = os.getenv("SEMANTIC_SERVICE_ENDPOINT", "http://oa_semantic_service:8080")
-METRICS_COLLECTOR_ENDPOINT = os.getenv("METRICS_COLLECTOR_ENDPOINT", "http://metrics-collector:8084")
+# FastAPI app
+app = FastAPI(
+    title="Dine-In Order Accuracy API",
+    description="Production API for validating food plate orders using VLM and semantic matching",
+    version="2.0.0"
+)
+
+# Pydantic models
+class OrderItem(BaseModel):
+    """Order item model"""
+    name: str = Field(..., description="Item name")
+    quantity: int = Field(1, ge=1, description="Item quantity")
 
 
-# Helper functions for VLM and Semantic services
+class OrderManifest(BaseModel):
+    """Order manifest containing expected items"""
+    items: List[OrderItem]
 
-async def call_ovms_vlm(image_bytes: bytes, prompt: str = "List all food items visible in this image with their quantities.") -> Dict:
-    """
-    Call OVMS VLM service to analyze the image.
+
+class ValidationResult(BaseModel):
+    """Validation result model"""
+    validation_id: str
+    image_id: str
+    order_complete: bool
+    accuracy_score: float
+    missing_items: List[Dict]
+    extra_items: List[Dict]
+    quantity_mismatches: List[Dict]
+    matched_items: List[Dict]
+    timestamp: str
+    metrics: Optional[Dict] = None
+
+
+class BenchmarkStatus(BaseModel):
+    """Benchmark status response"""
+    enabled: bool
+    status: str
+    current_metrics: Dict
+    worker_stats: List[Dict]
+    config: Dict
+
+
+# Service initialization
+def initialize_services():
+    """Initialize all services (lazy initialization)"""
+    cfg = config_manager.config
     
-    Args:
-        image_bytes: Image data as bytes
-        prompt: Prompt for the VLM model
-        
-    Returns:
-        Dict with detected items
-    """
-    try:
-        # Encode image to base64
-        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # Prepare VLM request
-        vlm_request = {
-            "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 500,
-            "temperature": 0.1
-        }
-        
-        logger.info(f"[OVMS] Sending VLM inference request")
-        start_time = time.time()
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{OVMS_ENDPOINT}/v3/chat/completions",
-                json=vlm_request
-            )
-        
-        vlm_latency = time.time() - start_time
-        logger.info(f"[OVMS] VLM inference completed in {vlm_latency:.2f}s")
-        
-        if response.status_code == 200:
-            result = response.json()
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            
-            # Log the raw VLM response
-            logger.info(f"[OVMS] VLM Raw Response: {content[:500]}...")  # Log first 500 chars
-            
-            # Parse VLM output to extract items
-            detected_items = parse_vlm_output(content)
-            
-            # Log detected items for debugging
-            logger.info(f"[OVMS] Detected items: {detected_items}")
-            
-            return {
-                "success": True,
-                "detected_items": detected_items,
-                "raw_output": content,
-                "inference_time_ms": int(vlm_latency * 1000)
-            }
-        else:
-            logger.error(f"[OVMS] VLM request failed: {response.status_code} - {response.text}")
-            return {
-                "success": False,
-                "error": f"VLM request failed with status {response.status_code}",
-                "detected_items": []
-            }
-            
-    except Exception as e:
-        logger.exception(f"[OVMS] Error calling VLM: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "detected_items": []
-        }
+    logger.info("Initializing services...")
+    
+    # Create VLM client
+    vlm_client = VLMClient(
+        endpoint=cfg.service.ovms_endpoint,
+        model_name=cfg.service.ovms_model_name,
+        timeout=cfg.service.api_timeout
+    )
+    
+    # Create semantic client
+    semantic_client = SemanticClient(
+        endpoint=cfg.service.semantic_service_endpoint,
+        timeout=cfg.service.api_timeout
+    )
+    
+    # Create validation service
+    validation_service = ValidationService(
+        vlm_client=vlm_client,
+        semantic_client=semantic_client
+    )
+    
+    logger.info("Services initialized successfully")
+    return validation_service
 
 
-def parse_vlm_output(content: str) -> List[Dict]:
-    """
-    Parse VLM output to extract items and quantities.
-    Handles both JSON format and plain text format.
-    
-    Args:
-        content: VLM response text
-        
-    Returns:
-        List of detected items with name and quantity
-    """
-    items = []
-    
-    # Try to parse as JSON first
-    try:
-        # Remove markdown code blocks if present
-        json_content = content.strip()
-        if json_content.startswith('```'):
-            # Extract JSON from code block
-            lines = json_content.split('\n')
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith('```'):
-                    in_block = not in_block
-                    continue
-                if in_block or (not line.strip().startswith('```')):
-                    json_lines.append(line)
-            json_content = '\n'.join(json_lines)
-        
-        # Try to parse as JSON
-        data = json.loads(json_content)
-        
-        # Handle different JSON structures
-        if isinstance(data, dict):
-            # Check for food_items array
-            if 'food_items' in data:
-                for item in data['food_items']:
-                    if isinstance(item, dict) and 'item' in item:
-                        items.append({
-                            "name": item['item'].lower(),
-                            "quantity": item.get('quantity', 1)
-                        })
-            # Check for items array
-            elif 'items' in data:
-                for item in data['items']:
-                    if isinstance(item, dict):
-                        name = item.get('item') or item.get('name', '')
-                        items.append({
-                            "name": name.lower(),
-                            "quantity": item.get('quantity', 1)
-                        })
-        elif isinstance(data, list):
-            # Direct array of items
-            for item in data:
-                if isinstance(item, dict):
-                    name = item.get('item') or item.get('name', '')
-                    items.append({
-                        "name": name.lower(),
-                        "quantity": item.get('quantity', 1)
-                    })
-        
-        if items:
-            logger.info(f"[PARSER] Parsed {len(items)} items from JSON")
-            return items
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.debug(f"[PARSER] JSON parsing failed, falling back to text parsing: {e}")
-    
-    # Fallback to line-by-line text parsing
-    lines = content.lower().strip().split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#') or line.startswith('```'):
-            continue
-            
-        # Try to extract quantity and name
-        quantity = 1
-        name = line
-        
-        # Remove bullet points and numbers
-        name = name.lstrip('•-*0123456789. ')
-        
-        # Look for quantity patterns
-        if 'x ' in name:
-            parts = name.split('x ', 1)
-            try:
-                quantity = int(parts[0].strip())
-                name = parts[1].strip()
-            except ValueError:
-                pass
-        elif ' (' in name and ')' in name:
-            # Pattern: item (quantity)
-            parts = name.split('(')
-            name = parts[0].strip()
-            if len(parts) > 1:
-                qty_str = parts[1].split(')')[0].strip()
-                try:
-                    quantity = int(qty_str)
-                except ValueError:
-                    pass
-        
-        if name and not name.startswith('{') and not name.startswith('}'):
-            items.append({"name": name, "quantity": quantity})
-    
-    logger.info(f"[PARSER] Parsed {len(items)} items from VLM output")
-    return items
+# Global services (initialized on first request)
+_validation_service: Optional[ValidationService] = None
+_benchmark_service: Optional[BenchmarkService] = None
 
 
-async def call_semantic_service(expected_item: str, detected_item: str) -> Dict:
-    """
-    Call semantic service to match items.
-    
-    Args:
-        expected_item: Expected item name from order
-        detected_item: Detected item name from VLM
-        
-    Returns:
-        Dict with match result and confidence
-    """
-    try:
-        # Configure httpx to respect NO_PROXY environment variable
-        async with httpx.AsyncClient(timeout=10.0, trust_env=True) as client:
-            response = await client.post(
-                f"{SEMANTIC_SERVICE_ENDPOINT}/api/v1/compare/semantic",
-                json={
-                    "text1": expected_item,
-                    "text2": detected_item,
-                    "context": "restaurant food items"
-                }
-            )
-        
-        if response.status_code == 200:
-            result = response.json()
-            return {
-                "match": result.get("match", False),
-                "confidence": result.get("confidence", 0.0)
-            }
-        else:
-            logger.warning(f"[SEMANTIC] Service returned {response.status_code}, using fuzzy match")
-            # Fallback to simple string matching
-            return {
-                "match": expected_item.lower() in detected_item.lower() or detected_item.lower() in expected_item.lower(),
-                "confidence": 0.5
-            }
-            
-    except Exception as e:
-        logger.error(f"[SEMANTIC] Error calling service: {e}")
-        # Fallback to simple string matching
-        return {
-            "match": expected_item.lower() in detected_item.lower() or detected_item.lower() in expected_item.lower(),
-            "confidence": 0.5
-        }
+def get_validation_service() -> ValidationService:
+    """Get or create validation service (singleton pattern)"""
+    global _validation_service
+    if _validation_service is None:
+        _validation_service = initialize_services()
+    return _validation_service
 
 
-async def validate_with_semantic_service(order_id: str, detected_items: List[Dict]) -> Dict:
-    """
-    Call semantic service with order_id and VLM results for batch validation.
-    
-    Args:
-        order_id: Order ID to match against (from orders.json)
-        detected_items: List of detected items from VLM with name and quantity
-        
-    Returns:
-        Dict with validation results including matched, missing, and extra items
-    """
-    try:
-        # Configure httpx to respect NO_PROXY environment variable
-        async with httpx.AsyncClient(timeout=30.0, trust_env=True) as client:
-            response = await client.post(
-                f"{SEMANTIC_SERVICE_ENDPOINT}/api/v1/validate/order",
-                json={
-                    "order_id": order_id,
-                    "detected_items": detected_items
-                }
-            )
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logger.warning(f"[SEMANTIC] Batch validation returned {response.status_code}, falling back to individual matching")
-            return None
-            
-    except Exception as e:
-        logger.error(f"[SEMANTIC] Error calling batch validation: {e}")
-        return None
+def get_benchmark_service() -> Optional[BenchmarkService]:
+    """Get benchmark service if enabled"""
+    global _benchmark_service
+    return _benchmark_service
 
+
+# In-memory storage for validation results
+validation_store: Dict[str, ValidationResult] = {}
+
+
+# Helper functions for metrics collection
 
 async def call_metrics_collector() -> Dict:
     """
-    Get CPU/GPU utilization metrics using psutil.
-    Fallback implementation since metrics-collector service doesn't expose HTTP API.
+    Get CPU/GPU utilization metrics from dedicated metrics-collector service.
     
     Returns:
         Dict with CPU and GPU metrics
     """
     try:
-        import psutil
+        import httpx
         
-        # Get CPU utilization (average over 0.1 seconds)
-        cpu_percent = psutil.cpu_percent(interval=0.1)
+        # Metrics collector serves on port 9000, not 8084
+        metrics_url = "http://metrics-collector:9000/metrics"
+        logger.info(f"[METRICS] Calling metrics collector at {metrics_url}")
         
-        # Get memory utilization
-        memory = psutil.virtual_memory()
-        memory_percent = memory.percent
-        
-        # Try to get GPU metrics (optional, may not be available)
-        gpu_utilization = 0.0
-        gpu_memory_utilization = 0.0
-        
-        try:
-            import subprocess
-            result = subprocess.run(['intel_gpu_top', '-J', '-s', '100'], 
-                                  capture_output=True, text=True, timeout=1)
-            if result.returncode == 0:
-                import json
-                gpu_data = json.loads(result.stdout)
-                gpu_utilization = gpu_data.get('engines', {}).get('Render/3D', {}).get('busy', 0.0)
-        except:
-            pass  # GPU metrics not available
-        
-        logger.info(f"[METRICS] System metrics: CPU={cpu_percent}%, Memory={memory_percent}%")
-        
-        return {
-            "cpu_utilization": round(cpu_percent, 2),
-            "gpu_utilization": round(gpu_utilization, 2),
-            "memory_utilization": round(memory_percent, 2),
-            "gpu_memory_utilization": round(gpu_memory_utilization, 2)
-        }
+        # Call metrics collector service
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(metrics_url)
+            response.raise_for_status()
+            
+            metrics_data = response.json()
+            logger.debug(f"[METRICS] Raw response keys: {list(metrics_data.keys())}")
+            
+            # Extract latest values from time-series arrays
+            # Response format: {"cpu_utilization": [[timestamp, value], ...], ...}
+            cpu_series = metrics_data.get('cpu_utilization', [])
+            gpu_series = metrics_data.get('gpu_utilization', [])
+            memory_series = metrics_data.get('memory', [])
+            
+            # Get latest values (last element in each array)
+            cpu_util = cpu_series[-1][1] if cpu_series else 0.0
+            gpu_util = gpu_series[-1][1] if gpu_series else 0.0
+            # Memory array format: [timestamp, total_gb, used_gb, avail_gb, percent]
+            memory_util = memory_series[-1][4] if memory_series and len(memory_series[-1]) > 4 else 0.0
+            
+            metrics_response = {
+                "cpu_utilization": round(cpu_util, 2),
+                "gpu_utilization": round(gpu_util, 2),
+                "memory_utilization": round(memory_util, 2),
+                "gpu_memory_utilization": 0.0  # Not available in current metrics
+            }
+            
+            logger.info(f"[METRICS] System metrics collected from service: {metrics_response}")
+            
+            return metrics_response
             
     except Exception as e:
-        logger.error(f"[METRICS] Error getting system metrics: {e}")
+        logger.error(f"[METRICS] Error getting metrics from collector service: {e}")
+        # Return zeros if metrics service is unavailable
         return {
             "cpu_utilization": 0.0,
             "gpu_utilization": 0.0,
@@ -365,239 +182,17 @@ async def call_metrics_collector() -> Dict:
         }
 
 
-async def validate_order_with_services(expected_items: List[Dict], detected_items: List[Dict], order_id: str = None) -> Tuple[Dict, Dict]:
-    """
-    Validate order using semantic matching.
-    
-    Args:
-        expected_items: List of expected items from order
-        detected_items: List of detected items from VLM
-        order_id: Optional order ID for batch validation with semantic service
-        
-    Returns:
-        Tuple of (validation_result, metrics)
-    """
-    start_time = time.time()
-    
-    # Track semantic matching latency
-    semantic_calls = 0
-    semantic_latency_total = 0
-    
-    # Try batch validation with semantic service first if order_id is provided
-    if order_id:
-        logger.info(f"[VALIDATION] Attempting batch validation with semantic service for order: {order_id}")
-        semantic_start = time.time()
-        batch_result = await validate_with_semantic_service(order_id, detected_items)
-        semantic_latency_total = time.time() - semantic_start
-        semantic_calls = 1
-        
-        if batch_result:
-            logger.info(f"[SEMANTIC] Batch validation successful in {semantic_latency_total*1000:.0f}ms")
-            
-            # Extract results from semantic service response
-            missing_items = [{"name": item, "quantity": 1} for item in batch_result.get("missing_items", [])]
-            extra_items = [{"name": item, "quantity": 1} for item in batch_result.get("extra_items", [])]
-            quantity_mismatches = batch_result.get("quantity_mismatches", [])
-            accuracy = batch_result.get("accuracy", 0.0)
-            
-            validation_latency = time.time() - start_time
-            system_metrics = await call_metrics_collector()
-            
-            validation_result = {
-                "order_complete": len(missing_items) == 0 and len(extra_items) == 0,
-                "missing_items": [item["name"] for item in missing_items],
-                "extra_items": [item["name"] for item in extra_items],
-                "modifier_validation": {
-                    "status": "validated" if len(quantity_mismatches) == 0 else "quantity_mismatch",
-                    "details": quantity_mismatches
-                },
-                "accuracy_score": accuracy
-            }
-            
-            metrics = {
-                "end_to_end_latency_ms": int(validation_latency * 1000),
-                "semantic_calls": semantic_calls,
-                "semantic_latency_ms": int(semantic_latency_total * 1000),
-                "within_operational_window": validation_latency < 2.0,
-                "cpu_utilization": system_metrics.get("cpu_utilization", 0.0),
-                "gpu_utilization": system_metrics.get("gpu_utilization", 0.0),
-                "memory_utilization": system_metrics.get("memory_utilization", 0.0),
-                "gpu_memory_utilization": system_metrics.get("gpu_memory_utilization", 0.0)
-            }
-            
-            logger.info(f"[VALIDATION] Complete: accuracy={accuracy:.2%}, missing={len(missing_items)}, extra={len(extra_items)}")
-            return validation_result, metrics
-        else:
-            logger.warning(f"[SEMANTIC] Batch validation failed, falling back to individual item matching")
-    
-    # Fallback to individual matching if batch validation not available or failed
-    missing_items = []
-    extra_items = []
-    quantity_mismatches = []
-    matched_detected = set()
-    
-    # Pass 1: Exact name matching
-    logger.info(f"[VALIDATION] Starting Pass 1 (exact matching) with {len(expected_items)} expected items")
-    for expected in expected_items:
-        exp_name = expected["name"].lower()
-        exp_qty = expected["quantity"]
-        found = False
-        
-        logger.info(f"[VALIDATION] Pass 1: Looking for expected item '{exp_name}' (qty={exp_qty})")
-        
-        for idx, detected in enumerate(detected_items):
-            if idx in matched_detected:
-                continue
-                
-            det_name = detected["name"].lower()
-            det_qty = detected["quantity"]
-            
-            if exp_name == det_name:
-                found = True
-                matched_detected.add(idx)
-                logger.info(f"[VALIDATION] Pass 1: EXACT MATCH found! '{exp_name}' == '{det_name}'")
-                
-                if exp_qty != det_qty:
-                    quantity_mismatches.append({
-                        "name": expected["name"],
-                        "expected": exp_qty,
-                        "detected": det_qty
-                    })
-                break
-        
-        if not found:
-            logger.info(f"[VALIDATION] Pass 1: No exact match for '{exp_name}', will try semantic matching")
-            missing_items.append(expected)
-    
-    # Pass 2: Semantic matching for unmatched items
-    logger.info(f"[VALIDATION] Starting Pass 2 (semantic matching) with {len(missing_items)} missing items")
-    still_missing = []
-    for expected in missing_items:
-        exp_name = expected["name"]
-        exp_qty = expected["quantity"]
-        found = False
-        
-        logger.info(f"[VALIDATION] Pass 2: Semantic search for '{exp_name}'")
-        
-        for idx, detected in enumerate(detected_items):
-            if idx in matched_detected:
-                continue
-            
-            det_name = detected["name"]
-            
-            logger.info(f"[VALIDATION] Pass 2: Comparing '{exp_name}' with '{det_name}' via semantic service")
-            
-            # Call semantic service
-            semantic_start = time.time()
-            match_result = await call_semantic_service(exp_name, det_name)
-            semantic_latency_total += (time.time() - semantic_start)
-            semantic_calls += 1
-            
-            logger.info(f"[VALIDATION] Pass 2: Semantic result - match={match_result['match']}, confidence={match_result['confidence']:.2f}")
-            
-            if match_result["match"]:
-                found = True
-                matched_detected.add(idx)
-                logger.info(f"[SEMANTIC] Matched '{exp_name}' with '{det_name}' (confidence={match_result['confidence']:.2f})")
-                
-                if exp_qty != detected["quantity"]:
-                    quantity_mismatches.append({
-                        "name": expected["name"],
-                        "expected": exp_qty,
-                        "detected": detected["quantity"]
-                    })
-                break
-        
-        if not found:
-            logger.info(f"[VALIDATION] Pass 2: NO MATCH found for '{exp_name}' even after semantic search")
-            still_missing.append(expected)
-    
-    # Find extra items
-    for idx, detected in enumerate(detected_items):
-        if idx not in matched_detected:
-            extra_items.append(detected)
-    
-    # Calculate accuracy
-    total_expected = len(expected_items)
-    correct = total_expected - len(still_missing)
-    accuracy = correct / total_expected if total_expected > 0 else 1.0
-    
-    validation_latency = time.time() - start_time
-    
-    # Get system metrics from metrics-collector
-    system_metrics = await call_metrics_collector()
-    
-    validation_result = {
-        "order_complete": len(still_missing) == 0 and len(extra_items) == 0,
-        "missing_items": [item["name"] for item in still_missing],
-        "extra_items": [item["name"] for item in extra_items],
-        "modifier_validation": {
-            "status": "validated" if len(quantity_mismatches) == 0 else "quantity_mismatch",
-            "details": quantity_mismatches
-        },
-        "accuracy_score": accuracy
+# API Endpoints
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    logger.debug("Health check requested")
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "benchmark_mode": config_manager.config.benchmark.enabled
     }
-    
-    metrics = {
-        "end_to_end_latency_ms": int(validation_latency * 1000),
-        "semantic_calls": semantic_calls,
-        "semantic_latency_ms": int(semantic_latency_total * 1000),
-        "within_operational_window": validation_latency < 2.0,
-        "cpu_utilization": system_metrics.get("cpu_utilization", 0.0),
-        "gpu_utilization": system_metrics.get("gpu_utilization", 0.0),
-        "memory_utilization": system_metrics.get("memory_utilization", 0.0),
-        "gpu_memory_utilization": system_metrics.get("gpu_memory_utilization", 0.0)
-    }
-    
-    logger.info(f"[VALIDATION] Complete: accuracy={accuracy:.2%}, missing={len(still_missing)}, extra={len(extra_items)}")
-    
-    return validation_result, metrics
-
-
-# Pydantic models for request/response
-class OrderItem(BaseModel):
-    name: str
-    quantity: int
-
-
-class OrderManifest(BaseModel):
-    order_id: str
-    table_number: Optional[str] = None
-    restaurant: Optional[str] = None
-    items: List[OrderItem]
-    modifiers: Optional[List[str]] = None
-
-
-class ValidationRequest(BaseModel):
-    image_id: Optional[str] = None
-    order: OrderManifest
-
-
-class BatchValidationRequest(BaseModel):
-    validations: List[ValidationRequest]
-
-
-class ValidationResult(BaseModel):
-    validation_id: str
-    timestamp: str
-    order_complete: bool
-    missing_items: List[str]
-    extra_items: List[str]
-    modifier_validation: Dict
-    accuracy_score: float
-    metrics: Dict
-
-
-# In-memory storage for validation results
-validation_store: Dict[str, ValidationResult] = {}
-
-
-# Create FastAPI app
-app = FastAPI(
-    title="Dine-In Order Accuracy API",
-    description="API for validating restaurant orders against plate images",
-    version="1.0.0"
-)
 
 
 @app.get("/")
@@ -605,236 +200,470 @@ async def root():
     """API root endpoint"""
     return {
         "service": "Dine-In Order Accuracy API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "validate": "/api/validate",
             "validate_batch": "/api/validate/batch",
-            "get_result": "/api/validate/{validation_id}"
+            "get_orders": "/api/orders",
+            "health": "/health"
         }
     }
+
+
+@app.get("/api/orders")
+async def get_orders():
+    """
+    Get all orders with image paths and metadata.
+    Returns a mapping of order_id to order details.
+    """
+    try:
+        configs_dir = Path(__file__).resolve().parent / "configs"
+        images_dir = Path(__file__).resolve().parent / "images"
+        orders_file = configs_dir / "orders.json"
+        
+        if not orders_file.exists():
+            raise HTTPException(status_code=404, detail="Orders file not found")
+        
+        with open(orders_file, 'r') as f:
+            orders_data = json.load(f)
+        
+        orders_mapping = {}
+        
+        for order in orders_data.get('orders', []):
+            order_id = order.get('order_id', '')
+            image_id = order.get('image_id', '')
+            
+            if not order_id or not image_id:
+                continue
+            
+            # Find image file (try different extensions)
+            image_path = None
+            for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                potential_path = images_dir / f"{image_id}{ext}"
+                if potential_path.exists():
+                    image_path = str(potential_path)
+                    break
+            
+            # Create label for UI display
+            label = (
+                f"{image_id} – {order.get('restaurant', 'Unknown')} "
+                f"Table {order.get('table_number', '?')}"
+            )
+            
+            orders_mapping[label] = {
+                "order_id": order_id,
+                "image_id": image_id,
+                "image_path": image_path,
+                "restaurant": order.get('restaurant', ''),
+                "table_number": order.get('table_number', ''),
+                "items_ordered": order.get('items_ordered', [])
+            }
+        
+        logger.info(f"[API] Loaded {len(orders_mapping)} orders")
+        return {
+            "success": True,
+            "count": len(orders_mapping),
+            "orders": orders_mapping
+        }
+        
+    except Exception as e:
+        logger.error(f"[API] Error loading orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error loading orders: {str(e)}")
 
 
 @app.post("/api/validate", response_model=ValidationResult)
 async def validate_plate(
     image: UploadFile = File(...),
-    order: str = Body(..., description="JSON string of order manifest")
+    order: str = Body(...)
 ):
     """
     Validate a single plate image against order manifest.
     
+    This endpoint performs:
+    1. VLM inference to detect items in the image
+    2. Semantic matching against expected order items
+    3. Accuracy calculation and validation result generation
+    
     Args:
-        image: Plate image file (PNG, JPG, etc.)
-        order: JSON string containing order manifest
+        image: Uploaded image file
+        order: JSON string of order manifest
         
     Returns:
-        ValidationResult with order accuracy analysis
+        ValidationResult with detailed analysis
     """
-    start_time = time.time()
+    logger.info(f"[API] Validation request received: image={image.filename}")
+    validation_id = str(uuid.uuid4())
     
     try:
-        # Parse order JSON
-        order_data = json.loads(order)
-        order_manifest = OrderManifest(**order_data)
+        # Parse order manifest
+        try:
+            order_data = json.loads(order)
+            order_manifest = OrderManifest(**order_data)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in order data: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        except Exception as e:
+            logger.error(f"Invalid order manifest format: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid order format: {e}")
         
-        # Read and validate image
+        # Read image bytes
         image_bytes = await image.read()
-        img = Image.open(BytesIO(image_bytes))
+        logger.debug(f"Image read: {len(image_bytes)} bytes")
         
-        logger.info(f"[API] Starting validation for order_id: {order_manifest.order_id}")
+        # Validate image
+        try:
+            img = Image.open(BytesIO(image_bytes))
+            logger.debug(f"Image validated: format={img.format}, size={img.size}, mode={img.mode}")
+        except Exception as e:
+            logger.error(f"Invalid image file: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
         
-        # Generate validation ID
-        validation_id = str(uuid.uuid4())
-        timestamp = datetime.now().isoformat()
+        # Get validation service
+        validation_service = get_validation_service()
         
-        # Step 1: Call OVMS VLM to detect items in the image
-        logger.info(f"[API] Step 1: Calling VLM service...")
-        vlm_result = await call_ovms_vlm(
-            image_bytes, 
-            prompt="Analyze this food plate image and list all visible food items with their quantities in JSON format."
+        # Extract image_id from filename and order_id from manifest
+        image_id = Path(image.filename).stem
+        order_id = order_data.get('order_id', image_id)
+        
+        # Generate unique request ID with station prefix
+        request_id = f"station1_{order_id}"
+        
+        # Perform validation
+        logger.info(f"[API] Starting validation: validation_id={validation_id}, image_id={image_id}, request_id={request_id}")
+        
+        result = await validation_service.validate_plate(
+            image_bytes=image_bytes,
+            order_manifest=order_manifest.model_dump(),
+            image_id=image_id,
+            request_id=request_id
         )
         
-        if not vlm_result.get("success"):
-            logger.error(f"[API] VLM inference failed: {vlm_result.get('error')}")
-            raise HTTPException(status_code=500, detail=f"VLM inference failed: {vlm_result.get('error')}")
+        # Collect system metrics
+        logger.info(f"[API] Calling metrics collector for {request_id}")
+        system_metrics = await call_metrics_collector()
+        logger.info(f"[API] Metrics collector response for {request_id}: {system_metrics}")
         
-        detected_items = vlm_result.get("detected_items", [])
-        vlm_latency_ms = vlm_result.get("inference_time_ms", 0)
-        logger.info(f"[API] VLM detected {len(detected_items)} items in {vlm_latency_ms}ms")
+        # Enhance metrics with system data
+        enhanced_metrics = None
+        if result.metrics:
+            base_metrics = result.metrics.to_dict()
+            vlm_latency_ms = int(base_metrics.get("vlm_inference_ms", 0))
+            enhanced_metrics = {
+                "end_to_end_latency_ms": vlm_latency_ms,  # Use VLM latency as primary metric
+                "vlm_inference_ms": vlm_latency_ms,
+                "agent_reconciliation_ms": int(base_metrics.get("semantic_matching_ms", 0)),
+                "within_operational_window": vlm_latency_ms < 2000,
+                "cpu_utilization": system_metrics.get("cpu_utilization", 0.0),
+                "gpu_utilization": system_metrics.get("gpu_utilization", 0.0),
+                "memory_utilization": system_metrics.get("memory_utilization", 0.0),
+                "gpu_memory_utilization": system_metrics.get("gpu_memory_utilization", 0.0)
+            }
+            logger.info(f"[API] Metrics for {request_id}: {enhanced_metrics}")
         
-        # Step 2: Validate order using semantic matching
-        logger.info(f"[API] Step 2: Performing semantic validation...")
-        expected_items = [{"name": item.name, "quantity": item.quantity} for item in order_manifest.items]
-        validation_result, validation_metrics = await validate_order_with_services(
-            expected_items, 
-            detected_items,
-            order_id=order_manifest.order_id
-        )
-        
-        logger.info(f"[API] Validation complete: accuracy={validation_result['accuracy_score']:.2%}")
-        
-        # Create validation result
-        result = ValidationResult(
+        # Build response
+        validation_result = ValidationResult(
             validation_id=validation_id,
-            timestamp=timestamp,
-            order_complete=validation_result["order_complete"],
-            missing_items=validation_result["missing_items"],
-            extra_items=validation_result["extra_items"],
-            modifier_validation=validation_result["modifier_validation"],
-            accuracy_score=validation_result.get("accuracy_score") or 0.0,
-            metrics=validation_metrics
+            image_id=result.image_id,
+            order_complete=result.order_complete,
+            accuracy_score=result.accuracy_score,
+            missing_items=result.missing_items,
+            extra_items=result.extra_items,
+            quantity_mismatches=result.quantity_mismatches,
+            matched_items=result.matched_items,
+            timestamp=datetime.now().isoformat(),
+            metrics=enhanced_metrics
         )
         
         # Store result
-        validation_store[validation_id] = result
+        validation_store[validation_id] = validation_result
         
-        total_latency_ms = int((time.time() - start_time) * 1000)
-        logger.info(f"[API] Total request latency: {total_latency_ms}ms")
+        logger.info(f"[API] Validation completed: validation_id={validation_id}, "
+                   f"accuracy={result.accuracy_score:.2f}, "
+                   f"complete={result.order_complete}")
         
-        return result
+        return validation_result
         
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid order JSON: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+        logger.exception(f"[API] Validation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
 
 
-@app.post("/api/validate/batch")
+@app.post("/api/validate/batch", response_model=List[ValidationResult])
 async def validate_batch(
     images: List[UploadFile] = File(...),
-    orders: str = Body(..., description="JSON array of order manifests mapped to images")
+    orders: str = Body(...)
 ):
     """
-    Validate multiple plates with their corresponding orders.
+    Validate multiple plate images in batch.
     
     Args:
-        images: List of plate image files
-        orders: JSON string containing array of order manifests (must match image count)
+        images: List of uploaded image files
+        orders: JSON string mapping image names to order manifests
         
     Returns:
-        List of ValidationResults
+        List of ValidationResult for each image
     """
+    logger.info(f"[API] Batch validation request: {len(images)} images")
+    
     try:
-        # Parse orders JSON
-        orders_data = json.loads(orders)
+        # Parse orders mapping
+        try:
+            orders_map = json.loads(orders)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in orders data: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
         
-        if len(images) != len(orders_data):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Image count ({len(images)}) must match order count ({len(orders_data)})"
-            )
-        
+        validation_service = get_validation_service()
         results = []
         
-        for idx, (image_file, order_data) in enumerate(zip(images, orders_data)):
+        # Process each image
+        for image in images:
+            validation_id = str(uuid.uuid4())
+            image_id = Path(image.filename).stem
+            
+            # Get order for this image
+            order_data = orders_map.get(image_id)
+            if not order_data:
+                logger.warning(f"No order found for image: {image_id}")
+                continue
+            
             try:
+                # Parse and validate order
                 order_manifest = OrderManifest(**order_data)
                 
-                # Read image
-                image_bytes = await image_file.read()
+                # Read and validate image
+                image_bytes = await image.read()
                 img = Image.open(BytesIO(image_bytes))
                 
-                # Generate validation ID
-                validation_id = str(uuid.uuid4())
-                timestamp = datetime.now().isoformat()
+                # Perform validation
+                logger.info(f"[API] Processing batch item: image_id={image_id}")
                 
-                # Get image_id
-                image_id = order_data.get("image_id") or order_manifest.order_id
-                
-                # Get validation profile
-                validation = _VALIDATION_PROFILES.get(image_id, _default_validation(image_id))
-                metrics = _METRIC_PROFILES.get(image_id, _default_metrics(image_id))
-                
-                # Create validation result
-                result = ValidationResult(
-                    validation_id=validation_id,
-                    timestamp=timestamp,
-                    order_complete=validation["order_complete"],
-                    missing_items=validation["missing_items"],
-                    extra_items=validation["extra_items"],
-                    modifier_validation=validation["modifier_validation"],
-                    accuracy_score=validation.get("accuracy_score") or 0.0,
-                    metrics=metrics
+                result = await validation_service.validate_plate(
+                    image_bytes=image_bytes,
+                    order_manifest=order_manifest.model_dump(),
+                    image_id=image_id
                 )
                 
-                # Store result
-                validation_store[validation_id] = result
-                results.append(result)
+                # Build response
+                validation_result = ValidationResult(
+                    validation_id=validation_id,
+                    image_id=result.image_id,
+                    order_complete=result.order_complete,
+                    accuracy_score=result.accuracy_score,
+                    missing_items=result.missing_items,
+                    extra_items=result.extra_items,
+                    quantity_mismatches=result.quantity_mismatches,
+                    matched_items=result.matched_items,
+                    timestamp=datetime.now().isoformat(),
+                    metrics=result.metrics.to_dict() if result.metrics else None
+                )
+                
+                # Store and collect result
+                validation_store[validation_id] = validation_result
+                results.append(validation_result)
+                
+                logger.info(f"[API] Batch item completed: image_id={image_id}, "
+                           f"accuracy={result.accuracy_score:.2f}")
                 
             except Exception as e:
-                # Add error result for this specific validation
-                results.append({
-                    "validation_id": None,
-                    "error": f"Failed to validate image {idx}: {str(e)}"
-                })
+                logger.error(f"[API] Failed to process image {image_id}: {e}")
+                continue
         
-        return JSONResponse(content={"results": [r.dict() if isinstance(r, ValidationResult) else r for r in results]})
+        logger.info(f"[API] Batch validation completed: {len(results)}/{len(images)} successful")
+        return results
         
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid orders JSON: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Batch validation error: {str(e)}")
+        logger.exception(f"[API] Batch validation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch validation failed: {str(e)}")
 
 
 @app.get("/api/validate/{validation_id}", response_model=ValidationResult)
 async def get_validation_result(validation_id: str):
-    """
-    Retrieve validation result by ID.
+    """Get validation result by ID"""
+    logger.debug(f"[API] Retrieving validation result: {validation_id}")
     
-    Args:
-        validation_id: Unique validation identifier
-        
-    Returns:
-        ValidationResult for the specified validation
-    """
     if validation_id not in validation_store:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Validation result not found for ID: {validation_id}"
-        )
+        logger.warning(f"[API] Validation not found: {validation_id}")
+        raise HTTPException(status_code=404, detail="Validation not found")
     
     return validation_store[validation_id]
 
 
-@app.get("/api/validate")
+@app.get("/api/validate", response_model=List[ValidationResult])
 async def list_validations():
-    """
-    List all validation results.
-    
-    Returns:
-        List of all stored validation results
-    """
-    return JSONResponse(content={
-        "total": len(validation_store),
-        "validations": [v.dict() for v in validation_store.values()]
-    })
+    """List all validation results"""
+    logger.debug(f"[API] Listing all validations: {len(validation_store)} total")
+    return list(validation_store.values())
 
 
 @app.delete("/api/validate/{validation_id}")
-async def delete_validation_result(validation_id: str):
-    """
-    Delete a validation result by ID.
+async def delete_validation(validation_id: str):
+    """Delete validation result by ID"""
+    logger.info(f"[API] Deleting validation: {validation_id}")
     
-    Args:
-        validation_id: Unique validation identifier
-        
-    Returns:
-        Success message
-    """
     if validation_id not in validation_store:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Validation result not found for ID: {validation_id}"
-        )
+        logger.warning(f"[API] Validation not found: {validation_id}")
+        raise HTTPException(status_code=404, detail="Validation not found")
     
     del validation_store[validation_id]
-    return {"message": f"Validation {validation_id} deleted successfully"}
+    return {"status": "deleted", "validation_id": validation_id}
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "dine-in-api",
-        "validations_stored": len(validation_store)
-    }
+# Benchmark endpoints
+
+@app.post("/api/benchmark/start")
+async def start_benchmark(background_tasks: BackgroundTasks):
+    """
+    Start benchmark mode with dynamic worker scaling.
+    
+    This endpoint starts multiple workers that continuously process
+    images and automatically scale based on latency and resource utilization.
+    """
+    global _benchmark_service
+    
+    if not config_manager.config.benchmark.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Benchmark mode is not enabled. Set BENCHMARK_MODE=true"
+        )
+    
+    if _benchmark_service is not None:
+        raise HTTPException(status_code=400, detail="Benchmark already running")
+    
+    logger.info("[API] Starting benchmark mode")
+    
+    try:
+        # Load test images and orders
+        images_dir = Path("images")
+        orders_dir = Path("orders")
+        
+        test_images = []
+        test_orders = []
+        
+        for img_path in sorted(images_dir.glob("*.png"))[:5]:  # Use first 5 images
+            with open(img_path, "rb") as f:
+                test_images.append(f.read())
+            
+            order_path = orders_dir / f"{img_path.stem}.json"
+            if order_path.exists():
+                with open(order_path) as f:
+                    test_orders.append(json.load(f))
+        
+        if not test_images:
+            raise HTTPException(status_code=500, detail="No test images found")
+        
+        # Create benchmark service
+        validation_service = get_validation_service()
+        _benchmark_service = BenchmarkService(
+            config=config_manager.config,
+            validation_service=validation_service,
+            test_images=test_images,
+            test_orders=test_orders
+        )
+        
+        # Start in background
+        background_tasks.add_task(_benchmark_service.start)
+        
+        logger.info("[API] Benchmark mode started")
+        return {
+            "status": "started",
+            "message": "Benchmark service started with dynamic scaling",
+            "config": {
+                "initial_workers": config_manager.config.benchmark.initial_workers,
+                "max_workers": config_manager.config.benchmark.max_workers,
+                "target_latency_ms": config_manager.config.benchmark.target_latency_ms
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[API] Failed to start benchmark: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start benchmark: {str(e)}")
+
+
+@app.post("/api/benchmark/stop")
+async def stop_benchmark():
+    """Stop benchmark mode"""
+    global _benchmark_service
+    
+    if _benchmark_service is None:
+        raise HTTPException(status_code=400, detail="Benchmark not running")
+    
+    logger.info("[API] Stopping benchmark mode")
+    
+    try:
+        await _benchmark_service.stop()
+        report = _benchmark_service.get_report()
+        _benchmark_service = None
+        
+        logger.info("[API] Benchmark mode stopped")
+        return {
+            "status": "stopped",
+            "final_report": report
+        }
+        
+    except Exception as e:
+        logger.exception(f"[API] Failed to stop benchmark: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop benchmark: {str(e)}")
+
+
+@app.get("/api/benchmark/status", response_model=BenchmarkStatus)
+async def get_benchmark_status():
+    """Get current benchmark status and metrics"""
+    benchmark_service = get_benchmark_service()
+    
+    if benchmark_service is None:
+        return BenchmarkStatus(
+            enabled=config_manager.config.benchmark.enabled,
+            status="not_running",
+            current_metrics={},
+            worker_stats=[],
+            config={
+                "initial_workers": config_manager.config.benchmark.initial_workers,
+                "max_workers": config_manager.config.benchmark.max_workers,
+                "target_latency_ms": config_manager.config.benchmark.target_latency_ms
+            }
+        )
+    
+    report = benchmark_service.get_report()
+    
+    return BenchmarkStatus(
+        enabled=config_manager.config.benchmark.enabled,
+        status=report["status"],
+        current_metrics=report["current_metrics"],
+        worker_stats=report["worker_stats"],
+        config=report["config"]
+    )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Application startup"""
+    logger.info("=" * 60)
+    logger.info("Dine-In Order Accuracy API Starting")
+    logger.info(f"Version: 2.0.0")
+    logger.info(f"Log Level: {config_manager.config.log_level}")
+    logger.info(f"OVMS Endpoint: {config_manager.config.service.ovms_endpoint}")
+    logger.info(f"Semantic Endpoint: {config_manager.config.service.semantic_service_endpoint}")
+    logger.info(f"Benchmark Mode: {config_manager.config.benchmark.enabled}")
+    logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Application shutdown"""
+    global _benchmark_service
+    
+    logger.info("Shutting down API...")
+    
+    # Stop benchmark if running
+    if _benchmark_service is not None:
+        logger.info("Stopping benchmark service...")
+        await _benchmark_service.stop()
+    
+    logger.info("API shutdown complete")

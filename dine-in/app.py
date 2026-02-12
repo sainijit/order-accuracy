@@ -40,7 +40,9 @@ APP_DESCRIPTION = (
 
 ROOT_DIR = Path(__file__).resolve().parent
 IMAGES_DIR = ROOT_DIR / "images"
-ORDERS_PATH = ROOT_DIR / "orders" / "orders.json"
+CONFIGS_DIR = ROOT_DIR / "configs"
+ORDERS_PATH = CONFIGS_DIR / "orders.json"
+INVENTORY_PATH = CONFIGS_DIR / "inventory.json"
 
 
 _VALIDATION_PROFILES: Dict[str, Dict[str, object]] = {

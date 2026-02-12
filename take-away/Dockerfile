@@ -61,9 +61,6 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
 # -------------------------------
 # Copy all modules
 COPY scripts /scripts
-COPY entrypoint.sh /entrypoint.sh
-
-
 
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 COPY src/core/ /app/core/

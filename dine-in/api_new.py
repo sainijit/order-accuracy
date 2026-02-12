@@ -124,6 +124,64 @@ def get_benchmark_service() -> Optional[BenchmarkService]:
 validation_store: Dict[str, ValidationResult] = {}
 
 
+# Helper functions for metrics collection
+
+async def call_metrics_collector() -> Dict:
+    """
+    Get CPU/GPU utilization metrics from dedicated metrics-collector service.
+    
+    Returns:
+        Dict with CPU and GPU metrics
+    """
+    try:
+        import httpx
+        
+        # Metrics collector serves on port 9000, not 8084
+        metrics_url = "http://metrics-collector:9000/metrics"
+        logger.info(f"[METRICS] Calling metrics collector at {metrics_url}")
+        
+        # Call metrics collector service
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(metrics_url)
+            response.raise_for_status()
+            
+            metrics_data = response.json()
+            logger.debug(f"[METRICS] Raw response keys: {list(metrics_data.keys())}")
+            
+            # Extract latest values from time-series arrays
+            # Response format: {"cpu_utilization": [[timestamp, value], ...], ...}
+            cpu_series = metrics_data.get('cpu_utilization', [])
+            gpu_series = metrics_data.get('gpu_utilization', [])
+            memory_series = metrics_data.get('memory', [])
+            
+            # Get latest values (last element in each array)
+            cpu_util = cpu_series[-1][1] if cpu_series else 0.0
+            gpu_util = gpu_series[-1][1] if gpu_series else 0.0
+            # Memory array format: [timestamp, total_gb, used_gb, avail_gb, percent]
+            memory_util = memory_series[-1][4] if memory_series and len(memory_series[-1]) > 4 else 0.0
+            
+            metrics_response = {
+                "cpu_utilization": round(cpu_util, 2),
+                "gpu_utilization": round(gpu_util, 2),
+                "memory_utilization": round(memory_util, 2),
+                "gpu_memory_utilization": 0.0  # Not available in current metrics
+            }
+            
+            logger.info(f"[METRICS] System metrics collected from service: {metrics_response}")
+            
+            return metrics_response
+            
+    except Exception as e:
+        logger.error(f"[METRICS] Error getting metrics from collector service: {e}")
+        # Return zeros if metrics service is unavailable
+        return {
+            "cpu_utilization": 0.0,
+            "gpu_utilization": 0.0,
+            "memory_utilization": 0.0,
+            "gpu_memory_utilization": 0.0
+        }
+
+
 # API Endpoints
 
 @app.get("/health")
@@ -135,6 +193,82 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "benchmark_mode": config_manager.config.benchmark.enabled
     }
+
+
+@app.get("/")
+async def root():
+    """API root endpoint"""
+    return {
+        "service": "Dine-In Order Accuracy API",
+        "version": "2.0.0",
+        "endpoints": {
+            "validate": "/api/validate",
+            "validate_batch": "/api/validate/batch",
+            "get_orders": "/api/orders",
+            "health": "/health"
+        }
+    }
+
+
+@app.get("/api/orders")
+async def get_orders():
+    """
+    Get all orders with image paths and metadata.
+    Returns a mapping of order_id to order details.
+    """
+    try:
+        configs_dir = Path(__file__).resolve().parent / "configs"
+        images_dir = Path(__file__).resolve().parent / "images"
+        orders_file = configs_dir / "orders.json"
+        
+        if not orders_file.exists():
+            raise HTTPException(status_code=404, detail="Orders file not found")
+        
+        with open(orders_file, 'r') as f:
+            orders_data = json.load(f)
+        
+        orders_mapping = {}
+        
+        for order in orders_data.get('orders', []):
+            order_id = order.get('order_id', '')
+            image_id = order.get('image_id', '')
+            
+            if not order_id or not image_id:
+                continue
+            
+            # Find image file (try different extensions)
+            image_path = None
+            for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                potential_path = images_dir / f"{image_id}{ext}"
+                if potential_path.exists():
+                    image_path = str(potential_path)
+                    break
+            
+            # Create label for UI display
+            label = (
+                f"{image_id} – {order.get('restaurant', 'Unknown')} "
+                f"Table {order.get('table_number', '?')}"
+            )
+            
+            orders_mapping[label] = {
+                "order_id": order_id,
+                "image_id": image_id,
+                "image_path": image_path,
+                "restaurant": order.get('restaurant', ''),
+                "table_number": order.get('table_number', ''),
+                "items_ordered": order.get('items_ordered', [])
+            }
+        
+        logger.info(f"[API] Loaded {len(orders_mapping)} orders")
+        return {
+            "success": True,
+            "count": len(orders_mapping),
+            "orders": orders_mapping
+        }
+        
+    except Exception as e:
+        logger.error(f"[API] Error loading orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error loading orders: {str(e)}")
 
 
 @app.post("/api/validate", response_model=ValidationResult)
@@ -187,17 +321,44 @@ async def validate_plate(
         # Get validation service
         validation_service = get_validation_service()
         
-        # Extract image_id from filename
+        # Extract image_id from filename and order_id from manifest
         image_id = Path(image.filename).stem
+        order_id = order_data.get('order_id', image_id)
+        
+        # Generate unique request ID with station prefix
+        request_id = f"station1_{order_id}"
         
         # Perform validation
-        logger.info(f"[API] Starting validation: validation_id={validation_id}, image_id={image_id}")
+        logger.info(f"[API] Starting validation: validation_id={validation_id}, image_id={image_id}, request_id={request_id}")
         
         result = await validation_service.validate_plate(
             image_bytes=image_bytes,
             order_manifest=order_manifest.model_dump(),
-            image_id=image_id
+            image_id=image_id,
+            request_id=request_id
         )
+        
+        # Collect system metrics
+        logger.info(f"[API] Calling metrics collector for {request_id}")
+        system_metrics = await call_metrics_collector()
+        logger.info(f"[API] Metrics collector response for {request_id}: {system_metrics}")
+        
+        # Enhance metrics with system data
+        enhanced_metrics = None
+        if result.metrics:
+            base_metrics = result.metrics.to_dict()
+            vlm_latency_ms = int(base_metrics.get("vlm_inference_ms", 0))
+            enhanced_metrics = {
+                "end_to_end_latency_ms": vlm_latency_ms,  # Use VLM latency as primary metric
+                "vlm_inference_ms": vlm_latency_ms,
+                "agent_reconciliation_ms": int(base_metrics.get("semantic_matching_ms", 0)),
+                "within_operational_window": vlm_latency_ms < 2000,
+                "cpu_utilization": system_metrics.get("cpu_utilization", 0.0),
+                "gpu_utilization": system_metrics.get("gpu_utilization", 0.0),
+                "memory_utilization": system_metrics.get("memory_utilization", 0.0),
+                "gpu_memory_utilization": system_metrics.get("gpu_memory_utilization", 0.0)
+            }
+            logger.info(f"[API] Metrics for {request_id}: {enhanced_metrics}")
         
         # Build response
         validation_result = ValidationResult(
@@ -210,7 +371,7 @@ async def validate_plate(
             quantity_mismatches=result.quantity_mismatches,
             matched_items=result.matched_items,
             timestamp=datetime.now().isoformat(),
-            metrics=result.metrics.to_dict() if result.metrics else None
+            metrics=enhanced_metrics
         )
         
         # Store result

@@ -4,6 +4,8 @@ take-away/models
 take-away/model
 take-away/storage/results
 take-away/storage/uploads
+ovms-service/cache/
+ovms-service/models/
 model
 dine-in/metrics/
 *.log

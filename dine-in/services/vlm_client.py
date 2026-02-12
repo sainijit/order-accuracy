@@ -6,6 +6,7 @@ Implements Adapter pattern for VLM inference abstraction.
 import base64
 import json
 import logging
+import time
 from typing import Dict, List, Any, Optional
 from io import BytesIO
 import httpx
@@ -28,17 +29,34 @@ class VLMResponse:
             # Extract content from OpenAI-compatible response
             if "choices" in self.raw_response:
                 content = self.raw_response["choices"][0]["message"]["content"]
+                logger.info(f"[PARSE] VLM content: {content[:500]}")  # Log first 500 chars
+                
+                # Strip markdown code blocks if present (```json ... ```)
+                content_stripped = content.strip()
+                if content_stripped.startswith("```"):
+                    # Remove opening ```json or ```
+                    lines = content_stripped.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]  # Remove first line
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]  # Remove last line
+                    content_stripped = "\n".join(lines)
+                    logger.info(f"[PARSE] Stripped markdown code blocks")
                 
                 # Try to parse as JSON first (structured output)
                 try:
-                    parsed_content = json.loads(content)
+                    parsed_content = json.loads(content_stripped)
+                    logger.info(f"[PARSE] Successfully parsed JSON: {parsed_content}")
                     if isinstance(parsed_content, dict) and "items" in parsed_content:
                         self.detected_items = parsed_content["items"]
+                        logger.info(f"[PARSE] Extracted {len(self.detected_items)} items from JSON dict")
                     elif isinstance(parsed_content, list):
                         self.detected_items = parsed_content
+                        logger.info(f"[PARSE] Extracted {len(self.detected_items)} items from JSON list")
                     else:
-                        logger.warning(f"Unexpected JSON structure in VLM response: {parsed_content}")
-                except json.JSONDecodeError:
+                        logger.warning(f"[PARSE] Unexpected JSON structure: {parsed_content}")
+                except json.JSONDecodeError as je:
+                    logger.info(f"[PARSE] JSON decode failed: {je}, falling back to natural language parsing")
                     # Fallback: parse natural language response
                     self._parse_natural_language(content)
                     
@@ -116,12 +134,13 @@ Return the result as a JSON object with this exact structure:
 Be specific with item names. For example, use "french fries" instead of just "fries", "chicken burger" instead of just "burger".
 Count quantities accurately."""
     
-    async def analyze_plate(self, image_bytes: bytes) -> VLMResponse:
+    async def analyze_plate(self, image_bytes: bytes, request_id: str = None) -> VLMResponse:
         """
         Analyze food plate image using VLM.
         
         Args:
             image_bytes: Raw image bytes
+            request_id: Optional unique request identifier for tracking
             
         Returns:
             VLMResponse with detected items
@@ -129,7 +148,9 @@ Count quantities accurately."""
         Raises:
             httpx.HTTPError: On network or API errors
         """
-        logger.info("Starting VLM analysis")
+        req_id = request_id or "unknown"
+        logger.info(f"Starting VLM analysis for request_id={req_id}")
+        vlm_request_start = time.time()
         
         try:
             # Encode image
@@ -153,7 +174,9 @@ Count quantities accurately."""
             
             # Make async request
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                logger.debug(f"Sending request to {self.chat_endpoint}")
+                logger.info(f"[VLM_REQUEST] Sending to OVMS for {req_id}")
+                request_sent_time = time.time()
+                
                 response = await client.post(
                     self.chat_endpoint,
                     json=payload,
@@ -161,9 +184,12 @@ Count quantities accurately."""
                 )
                 response.raise_for_status()
                 
+                response_received_time = time.time()
+                vlm_latency_ms = (response_received_time - request_sent_time) * 1000
+                
                 result = response.json()
-                logger.info(f"VLM analysis completed successfully")
-                logger.debug(f"Raw VLM response: {result}")
+                logger.info(f"[VLM_RESPONSE] Received from OVMS for {req_id}, latency={vlm_latency_ms:.2f}ms")
+                logger.info(f"[VLM_RESPONSE] Raw response: {result}")  # Changed from debug to info
                 
                 return VLMResponse(result)
                 

@@ -223,7 +223,8 @@ class ValidationService:
         self,
         image_bytes: bytes,
         order_manifest: Dict[str, Any],
-        image_id: str
+        image_id: str,
+        request_id: str = None
     ) -> ValidationResult:
         """
         Validate plate against order manifest using VLM and semantic matching.
@@ -232,19 +233,20 @@ class ValidationService:
             image_bytes: Raw image data
             order_manifest: Expected order items
             image_id: Unique identifier for this validation
+            request_id: Optional unique request identifier for tracking
             
         Returns:
             Complete ValidationResult with metrics
         """
-        logger.info(f"Starting plate validation: image_id={image_id}")
+        logger.info(f"Starting plate validation: image_id={image_id}, request_id={request_id}")
         start_time = time.time()
         
         try:
             # Step 1: VLM Inference
             vlm_start = time.time()
-            vlm_response: VLMResponse = await self.vlm_client.analyze_plate(image_bytes)
+            vlm_response: VLMResponse = await self.vlm_client.analyze_plate(image_bytes, request_id=request_id)
             vlm_time_ms = (time.time() - vlm_start) * 1000
-            logger.info(f"VLM inference completed in {vlm_time_ms:.2f}ms, "
+            logger.info(f"VLM inference completed in {vlm_time_ms:.2f}ms for {request_id}, "
                        f"detected {len(vlm_response.detected_items)} items")
             
             # Extract expected items from order manifest
