@@ -5,3 +5,6 @@ take-away/model
 take-away/storage/results
 take-away/storage/uploads
 model
+dine-in/metrics/
+*.log
+*.csv
